@@ -38,13 +38,13 @@ CFG = Config()
 
 
 def setup_dist():
-    dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     return local_rank, rank, world_size
-
+    
 
 def cleanup_dist():
     if dist.is_initialized():
