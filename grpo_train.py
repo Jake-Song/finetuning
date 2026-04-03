@@ -3,7 +3,7 @@ import asyncio
 import gc
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import aiohttp
@@ -24,8 +24,8 @@ from trl import GRPOConfig, GRPOTrainer
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    dataset_path: str = "data/opencodereasoning_filtered_25k_train.jsonl"
-    eval_dataset_path: str = "data/livecodebench_v5_2024-07-01_2025-02-01_validation.jsonl"
+    dataset_path: str = "/workspace/Gym/resources_servers/code_gen/data/opencodereasoning_filtered_25k_train.jsonl"
+    eval_dataset_path: str = "/workspace/Gym/resources_servers/code_gen/data/livecodebench_v5_2024-07-01_2025-02-01_validation.jsonl"
 
     # GRPO
     num_generations: int = 8
@@ -56,6 +56,9 @@ class TrainConfig:
 
     # wandb
     report_to: str = "none"
+    wandb_project: str = "nemo-grpo"
+    wandb_entity: str = ""
+    wandb_mode: str = "online"
     task: str = "code_gen"
 
 
@@ -339,6 +342,71 @@ def cleanup_compute() -> None:
         torch.cuda.ipc_collect()
 
 
+def _is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _wandb_enabled(report_to: str) -> bool:
+    targets = {target.strip().lower() for target in report_to.split(",")}
+    return "wandb" in targets
+
+
+ENV_YAML_PATH = os.path.join(os.path.dirname(__file__), "env.yaml")
+
+
+def _load_env_yaml() -> dict:
+    if not os.path.exists(ENV_YAML_PATH):
+        return {}
+    with open(ENV_YAML_PATH) as f:
+        return yaml.safe_load(f) or {}
+
+
+def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
+    if not _wandb_enabled(cfg.report_to) or not _is_main_process():
+        return
+
+    try:
+        import wandb
+    except ImportError as e:
+        raise ImportError(
+            "W&B logging is enabled but `wandb` is not installed. Install it with: uv add wandb"
+        ) from e
+
+    os.environ["WANDB_PROJECT"] = cfg.wandb_project
+    if cfg.wandb_entity:
+        os.environ["WANDB_ENTITY"] = cfg.wandb_entity
+    os.environ["WANDB_MODE"] = cfg.wandb_mode
+
+    env = _load_env_yaml()
+    api_key = env.get("wandb_api_key", "") or os.environ.get("WANDB_API_KEY", "")
+    login_kwargs: dict[str, Any] = {"relogin": True}
+    if api_key:
+        login_kwargs["key"] = api_key
+    wandb.login(**login_kwargs)
+
+    if wandb.run is None:
+        init_kwargs: dict[str, Any] = {
+            "project": cfg.wandb_project,
+            "name": run_name,
+            "mode": cfg.wandb_mode,
+            "config": asdict(cfg),
+        }
+        if cfg.wandb_entity:
+            init_kwargs["entity"] = cfg.wandb_entity
+        wandb.init(**init_kwargs)
+
+
+def finish_wandb() -> None:
+    if not _is_main_process():
+        return
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is not None:
+        wandb.finish()
+
+
 # -----------------------------
 # Dry run
 # -----------------------------
@@ -358,6 +426,10 @@ def dry_run(cfg: TrainConfig):
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
     print(f"  output_dir:       {cfg.output_dir}")
+    print(f"  report_to:        {cfg.report_to}")
+    if _wandb_enabled(cfg.report_to):
+        print(f"  wandb_project:    {cfg.wandb_project}")
+        print(f"  wandb_entity:     {cfg.wandb_entity or '(default)'}")
 
     # agent server discovery
     print(f"\n[Agent Servers]")
@@ -455,6 +527,7 @@ def main():
     parser.add_argument("--vllm-server-host", type=str, default=None)
     parser.add_argument("--head-server-host", type=str, default=None)
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
+    parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging (optionally override project name)")
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -469,6 +542,10 @@ def main():
         overrides["vllm_server_host"] = args.vllm_server_host
     if args.head_server_host:
         overrides["head_server_host"] = args.head_server_host
+    if args.run is not None:
+        overrides["report_to"] = "wandb"
+        if args.run:
+            overrides["wandb_project"] = args.run
 
     for k, v in overrides.items():
         if hasattr(cfg, k):
@@ -540,6 +617,7 @@ def main():
         f"_ga{cfg.gradient_accumulation_steps}"
         f"_lr{cfg.learning_rate}"
     )
+    setup_wandb(cfg, training_args.run_name)
 
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -560,6 +638,7 @@ def main():
     try:
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     finally:
+        finish_wandb()
         cleanup_compute()
 
 
