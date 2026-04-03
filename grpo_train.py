@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import gc
 import json
 import os
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from typing import Any
 
 import aiohttp
 import requests
+import torch
+import torch.distributed as dist
 import yaml
 from datasets import Dataset, load_dataset
 from omegaconf import OmegaConf
@@ -326,6 +329,16 @@ def load_dataset_from_jsonl(path: str) -> Dataset:
     return Dataset.from_list(data)
 
 
+def cleanup_compute() -> None:
+    """Best-effort cleanup for distributed and GPU state before exit."""
+    gc.collect()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
 # -----------------------------
 # Dry run
 # -----------------------------
@@ -544,7 +557,10 @@ def main():
         args=training_args,
     )
 
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    try:
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    finally:
+        cleanup_compute()
 
 
 if __name__ == "__main__":
