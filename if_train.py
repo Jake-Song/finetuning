@@ -4,13 +4,14 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import yaml
 from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 
 from trl import GRPOConfig, GRPOTrainer
 
@@ -337,6 +338,32 @@ def finish_wandb() -> None:
         wandb.finish()
 
 
+class EvalLogCallback(TrainerCallback):
+    """Appends evaluation metrics to a markdown file after each eval run."""
+
+    def __init__(self, output_dir: str):
+        self.log_path = os.path.join(output_dir, "eval_results.md")
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None or int(os.environ.get("RANK", "0")) != 0:
+            return
+        step = state.global_step
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # write header on first eval
+        write_header = not os.path.exists(self.log_path)
+        with open(self.log_path, "a") as f:
+            if write_header:
+                f.write("# Evaluation Results\n\n")
+                f.write("| Step | Timestamp | " + " | ".join(sorted(metrics.keys())) + " |\n")
+                f.write("|------|-----------|" + "|".join("---" for _ in metrics) + "|\n")
+            values = " | ".join(
+                f"{metrics[k]:.4f}" if isinstance(metrics[k], float) else str(metrics[k])
+                for k in sorted(metrics.keys())
+            )
+            f.write(f"| {step} | {timestamp} | {values} |\n")
+
+
 def cleanup_compute() -> None:
     gc.collect()
     if dist.is_available() and dist.is_initialized():
@@ -506,6 +533,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=training_args,
+        callbacks=[EvalLogCallback(cfg.output_dir)] if eval_dataset else None,
     )
 
     try:
