@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import time
 from collections import Counter
 
@@ -8,6 +9,13 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from swe_rl_train import _extract_changed_lines
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator from the Codex/HumanEval paper."""
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
 def load_tokenizer_with_safe_mistral_fix(path: str):
@@ -125,10 +133,21 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples to evaluate")
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of samples per example for pass@k")
+    parser.add_argument("--pass-k", type=str, default="1", help="Comma-separated k values for pass@k (e.g. 1,5,10)")
     parser.add_argument("--output-jsonl", type=str, default=None, help="Save per-example results to JSONL")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     args = parser.parse_args()
+
+    k_values = [int(k) for k in args.pass_k.split(",")]
+    num_samples = args.num_samples
+    temperature = args.temperature
+
+    # force sampling when generating multiple samples
+    if num_samples > 1 and temperature == 0.0:
+        temperature = 0.7
+        print(f"Note: temperature set to {temperature} for multi-sample generation")
 
     # resolve device/dtype
     if args.device == "auto":
@@ -154,13 +173,15 @@ def main():
     examples = load_swe_rl_examples(args.dataset_name, args.dataset_config)
     if args.max_examples:
         examples = examples[:args.max_examples]
-    print(f"Evaluating on {len(examples)} examples")
+    print(f"Evaluating on {len(examples)} examples, {num_samples} sample(s) each")
 
     # run eval
     metric_sums = Counter()
     total_examples = 0
     exact_matches = 0
-    source_scores = {}  # per-source average scores
+    source_scores = {}
+    pass_k_strict_sums = {k: 0.0 for k in k_values}  # exact match
+    pass_k_loose_sums = {k: 0.0 for k in k_values}   # total >= 0.5
     results = []
     started = time.time()
 
@@ -169,40 +190,75 @@ def main():
         golden_patch = ex["golden_patch"]
         source = ex.get("source", "unknown")
 
-        completion = generate(model, tokenizer, prompt, args.max_new_tokens, args.temperature, device)
-        scores = score_patch(completion, golden_patch)
+        samples = []
+        n_exact = 0
+        n_loose = 0
+        best_scores = None
+
+        for s in range(num_samples):
+            completion = generate(model, tokenizer, prompt, args.max_new_tokens, temperature, device)
+            scores = score_patch(completion, golden_patch)
+
+            if scores["exact_match"] == 1.0:
+                n_exact += 1
+            if scores["total"] >= 0.5:
+                n_loose += 1
+
+            if best_scores is None or scores["total"] > best_scores["total"]:
+                best_scores = scores
+
+            # aggregate metrics from first sample (for backward compat)
+            if s == 0:
+                for metric, val in scores.items():
+                    metric_sums[metric] += val
+                if scores["exact_match"] == 1.0:
+                    exact_matches += 1
+
+            samples.append({
+                "completion": completion[:2000],
+                "scores": scores,
+            })
 
         total_examples += 1
-        for metric, val in scores.items():
-            metric_sums[metric] += val
-        if scores["exact_match"] == 1.0:
-            exact_matches += 1
+
+        for k in k_values:
+            pass_k_strict_sums[k] += pass_at_k(num_samples, n_exact, k)
+            pass_k_loose_sums[k] += pass_at_k(num_samples, n_loose, k)
 
         # track per-source
         if source not in source_scores:
             source_scores[source] = {"total_score": 0.0, "count": 0, "exact": 0}
-        source_scores[source]["total_score"] += scores["total"]
+        source_scores[source]["total_score"] += best_scores["total"]
         source_scores[source]["count"] += 1
-        if scores["exact_match"] == 1.0:
+        if n_exact > 0:
             source_scores[source]["exact"] += 1
 
         result = {
             "instance_id": ex.get("instance_id", ""),
             "source": source,
             "prompt": prompt[:500],
-            "completion": completion[:2000],
             "golden_patch": golden_patch[:2000],
-            "scores": scores,
+            "n_exact": n_exact,
+            "n_loose": n_loose,
+            "num_samples": num_samples,
+            "best_scores": best_scores,
         }
+        if num_samples == 1:
+            result["completion"] = samples[0]["completion"]
+            result["scores"] = samples[0]["scores"]
+        else:
+            result["samples"] = samples
         results.append(result)
 
         if (i + 1) % 10 == 0 or i == len(examples) - 1:
             elapsed = time.time() - started
             avg_time = elapsed / (i + 1)
             avg_total = metric_sums["total"] / total_examples
+            strict_str = "  ".join(
+                f"pass@{k}={100*pass_k_strict_sums[k]/total_examples:.1f}%" for k in k_values
+            )
             print(f"  [{i+1}/{len(examples)}] avg_score={avg_total:.3f}  "
-                  f"exact_match={exact_matches}/{total_examples}  "
-                  f"overlap={metric_sums['overlap']/total_examples:.3f}  "
+                  f"{strict_str}  "
                   f"{avg_time:.1f}s/example")
 
     # final report
@@ -211,18 +267,26 @@ def main():
     print(f"SWE-RL Results: {args.checkpoint}")
     print(f"{'='*60}")
     print(f"  Examples:       {total_examples}")
+    print(f"  Samples/example: {num_samples}")
     print(f"  Time:           {elapsed:.1f}s ({elapsed/max(total_examples,1):.1f}s/example)")
 
-    print(f"\n  Metrics (averaged):")
+    print(f"\n  Metrics (averaged, first sample):")
     for metric in ["total", "format", "structure", "length", "overlap", "exact_match"]:
         avg = metric_sums[metric] / max(total_examples, 1)
         print(f"    {metric:15s}: {avg:.3f}")
 
-    print(f"\n  Exact matches:  {exact_matches}/{total_examples} "
-          f"({100*exact_matches/max(total_examples,1):.1f}%)")
+    print(f"\n  pass@k (strict = exact match):")
+    for k in k_values:
+        avg = pass_k_strict_sums[k] / max(total_examples, 1)
+        print(f"    pass@{k}: {100*avg:.1f}%")
+
+    print(f"\n  pass@k (loose = score >= 0.5):")
+    for k in k_values:
+        avg = pass_k_loose_sums[k] / max(total_examples, 1)
+        print(f"    pass@{k}: {100*avg:.1f}%")
 
     if source_scores:
-        print(f"\n  Per-source breakdown:")
+        print(f"\n  Per-source breakdown (best of {num_samples}):")
         for source in sorted(source_scores, key=lambda s: source_scores[s]["count"], reverse=True):
             info = source_scores[source]
             avg = info["total_score"] / info["count"]
