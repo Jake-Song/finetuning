@@ -6,14 +6,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.1",
-    "trl==0.23.1; python_full_version >= '3.13'",
-    "trl[vllm]==0.16.1; python_full_version >= '3.12' and python_full_version < '3.13' and sys_platform == 'win32'",
-    "trl[vllm]==0.14.0; (python_full_version < '3.13' and sys_platform != 'win32') or (python_full_version < '3.12' and sys_platform == 'win32')",
-    "aiohttp==3.13.5",
-    "omegaconf==2.3.0",
-    "pyyaml==6.0.3",
-    "datasets==4.8.4",
-    "accelerate==1.13.0",
-    "huggingface-hub==1.9.0",
-    "wandb==0.25.1",
+    "trl[vllm]",
+    "aiohttp",
+    "omegaconf",
+    "pyyaml",
+    "datasets",
+    "accelerate",
+    "huggingface-hub",
+    "wandb",
 ]

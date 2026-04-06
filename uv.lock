@@ -498,17 +498,15 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", specifier = "==1.13.0" },
-    { name = "aiohttp", specifier = "==3.13.5" },
-    { name = "datasets", specifier = "==4.8.4" },
-    { name = "huggingface-hub", specifier = "==1.9.0" },
-    { name = "omegaconf", specifier = "==2.3.0" },
-    { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "accelerate" },
+    { name = "aiohttp" },
+    { name = "datasets" },
+    { name = "huggingface-hub" },
+    { name = "omegaconf" },
+    { name = "pyyaml" },
     { name = "torch", specifier = "==2.9.1" },
-    { name = "trl", marker = "python_full_version >= '3.13'", specifier = "==0.23.1" },
-    { name = "trl", extras = ["vllm"], marker = "python_full_version == '3.12.*' and sys_platform == 'win32'", specifier = "==0.16.1" },
-    { name = "trl", extras = ["vllm"], marker = "(python_full_version < '3.13' and sys_platform != 'win32') or (python_full_version < '3.12' and sys_platform == 'win32')", specifier = "==0.14.0" },
-    { name = "wandb", specifier = "==0.25.1" },
+    { name = "trl", extras = ["vllm"] },
+    { name = "wandb" },
 ]
 
 [[package]]
