@@ -126,7 +126,11 @@ def load_swe_rl_dataset(
 
     rows = []
     for example in ds:
-        prompt_text = example["prompt"]
+        prompt_text = example.get("prompt") or example.get("problem_statement")
+        golden_patch = example.get("golden_patch") or example.get("patch")
+        if not prompt_text or not golden_patch:
+            # Skip malformed records instead of failing the entire run.
+            continue
 
         # truncate long prompts to max_prompt_length tokens
         tokens = tokenizer.encode(prompt_text, truncation=True, max_length=max_prompt_length)
@@ -134,8 +138,14 @@ def load_swe_rl_dataset(
 
         rows.append({
             "prompt": [{"role": "user", "content": prompt_text}],
-            "golden_patch": example["golden_patch"],
+            "golden_patch": golden_patch,
         })
+
+    if not rows:
+        raise ValueError(
+            f"No usable rows found in dataset {name}/{config}. "
+            "Expected prompt+patch fields like (prompt, golden_patch) or (problem_statement, patch)."
+        )
 
     full = Dataset.from_list(rows)
     if eval_size > 0 and eval_size < len(full):

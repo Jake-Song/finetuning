@@ -10,9 +10,36 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from swe_rl_train import _extract_changed_lines
 
 
+def load_tokenizer_with_safe_mistral_fix(path: str):
+    """Load tokenizer and enable Mistral regex fix when supported."""
+    try:
+        return AutoTokenizer.from_pretrained(path, fix_mistral_regex=True)
+    except TypeError:
+        # Older transformers versions may not support this kwarg.
+        return AutoTokenizer.from_pretrained(path)
+
+
 def load_swe_rl_examples(name: str, config: str) -> list[dict]:
     ds = load_dataset(name, config, split="train")
-    return list(ds)
+    rows = []
+    for ex in ds:
+        prompt = ex.get("prompt") or ex.get("problem_statement")
+        golden_patch = ex.get("golden_patch") or ex.get("patch")
+        if not prompt or not golden_patch:
+            continue
+
+        rows.append({
+            **ex,
+            "prompt": prompt,
+            "golden_patch": golden_patch,
+        })
+
+    if not rows:
+        raise ValueError(
+            f"No usable rows found in dataset {name}/{config}. "
+            "Expected prompt+patch fields like (prompt, golden_patch) or (problem_statement, patch)."
+        )
+    return rows
 
 
 @torch.inference_mode()
@@ -116,7 +143,7 @@ def main():
 
     # load model
     print(f"Loading model from {args.checkpoint} (device={device}, dtype={dtype})")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.checkpoint)
+    tokenizer = load_tokenizer_with_safe_mistral_fix(args.tokenizer or args.checkpoint)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.checkpoint, torch_dtype=dtype)
