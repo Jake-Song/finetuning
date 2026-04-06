@@ -1,0 +1,215 @@
+import argparse
+import json
+import time
+from collections import Counter
+
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from swe_rl_train import _extract_changed_lines
+
+
+def load_swe_rl_examples(name: str, config: str) -> list[dict]:
+    ds = load_dataset(name, config, split="train")
+    return list(ds)
+
+
+@torch.inference_mode()
+def generate(model, tokenizer, prompt: str, max_new_tokens: int, temperature: float, device: torch.device) -> str:
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=model.config.max_position_embeddings - max_new_tokens)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        do_sample=temperature > 0,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    prompt_len = inputs["input_ids"].shape[1]
+    return tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+
+
+def score_patch(generated: str, golden: str) -> dict:
+    """Score a generated patch against the golden patch. Returns individual metric scores."""
+    gen = generated.strip()
+    gold = golden.strip()
+
+    if not gen:
+        return {"format": 0.0, "structure": 0.0, "length": 0.0, "overlap": 0.0, "exact_match": 0.0, "total": 0.0}
+
+    import re
+
+    # format (0-1): valid unified diff structure
+    has_diff_headers = bool(re.search(r"^---\s", gen, re.MULTILINE)) and bool(
+        re.search(r"^\+\+\+\s", gen, re.MULTILINE)
+    )
+    has_hunks = bool(re.search(r"^@@\s", gen, re.MULTILINE))
+    if has_diff_headers and has_hunks:
+        fmt = 1.0
+    elif has_hunks:
+        fmt = 0.5
+    else:
+        fmt = 0.0
+
+    # structure: contains file paths
+    has_file_path = bool(re.search(r"[a-zA-Z_/]+\.\w+", gen))
+    structure = 1.0 if has_file_path else 0.0
+
+    # length: non-trivial but not excessively long
+    length = 1.0 if 10 < len(gen) < len(gold) * 5 else 0.0
+
+    # overlap: Jaccard similarity of changed lines
+    gen_lines = _extract_changed_lines(gen)
+    gold_lines = _extract_changed_lines(gold)
+    if gen_lines and gold_lines:
+        intersection = len(gen_lines & gold_lines)
+        union = len(gen_lines | gold_lines)
+        overlap = intersection / union if union > 0 else 0.0
+    else:
+        overlap = 0.0
+
+    # exact match
+    exact = 1.0 if gen == gold else 0.0
+
+    # weighted total (same weights as training reward)
+    total = 0.2 * fmt + 0.1 * structure + 0.1 * length + 0.4 * overlap + 0.2 * exact
+
+    return {
+        "format": fmt,
+        "structure": structure,
+        "length": length,
+        "overlap": overlap,
+        "exact_match": exact,
+        "total": total,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained model on SWE-RL patch generation")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
+    parser.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path (defaults to checkpoint)")
+    parser.add_argument("--dataset-name", type=str, default="nvidia/Nemotron-Cascade-2-RL-data")
+    parser.add_argument("--dataset-config", type=str, default="SWE-RL")
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples to evaluate")
+    parser.add_argument("--output-jsonl", type=str, default=None, help="Save per-example results to JSONL")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"])
+    args = parser.parse_args()
+
+    # resolve device/dtype
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    if args.dtype == "auto":
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    else:
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+
+    # load model
+    print(f"Loading model from {args.checkpoint} (device={device}, dtype={dtype})")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.checkpoint)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.checkpoint, torch_dtype=dtype)
+    model.to(device)
+    model.eval()
+
+    # load dataset
+    examples = load_swe_rl_examples(args.dataset_name, args.dataset_config)
+    if args.max_examples:
+        examples = examples[:args.max_examples]
+    print(f"Evaluating on {len(examples)} examples")
+
+    # run eval
+    metric_sums = Counter()
+    total_examples = 0
+    exact_matches = 0
+    source_scores = {}  # per-source average scores
+    results = []
+    started = time.time()
+
+    for i, ex in enumerate(examples):
+        prompt = ex["prompt"]
+        golden_patch = ex["golden_patch"]
+        source = ex.get("source", "unknown")
+
+        completion = generate(model, tokenizer, prompt, args.max_new_tokens, args.temperature, device)
+        scores = score_patch(completion, golden_patch)
+
+        total_examples += 1
+        for metric, val in scores.items():
+            metric_sums[metric] += val
+        if scores["exact_match"] == 1.0:
+            exact_matches += 1
+
+        # track per-source
+        if source not in source_scores:
+            source_scores[source] = {"total_score": 0.0, "count": 0, "exact": 0}
+        source_scores[source]["total_score"] += scores["total"]
+        source_scores[source]["count"] += 1
+        if scores["exact_match"] == 1.0:
+            source_scores[source]["exact"] += 1
+
+        result = {
+            "instance_id": ex.get("instance_id", ""),
+            "source": source,
+            "prompt": prompt[:500],
+            "completion": completion[:2000],
+            "golden_patch": golden_patch[:2000],
+            "scores": scores,
+        }
+        results.append(result)
+
+        if (i + 1) % 10 == 0 or i == len(examples) - 1:
+            elapsed = time.time() - started
+            avg_time = elapsed / (i + 1)
+            avg_total = metric_sums["total"] / total_examples
+            print(f"  [{i+1}/{len(examples)}] avg_score={avg_total:.3f}  "
+                  f"exact_match={exact_matches}/{total_examples}  "
+                  f"overlap={metric_sums['overlap']/total_examples:.3f}  "
+                  f"{avg_time:.1f}s/example")
+
+    # final report
+    elapsed = time.time() - started
+    print(f"\n{'='*60}")
+    print(f"SWE-RL Results: {args.checkpoint}")
+    print(f"{'='*60}")
+    print(f"  Examples:       {total_examples}")
+    print(f"  Time:           {elapsed:.1f}s ({elapsed/max(total_examples,1):.1f}s/example)")
+
+    print(f"\n  Metrics (averaged):")
+    for metric in ["total", "format", "structure", "length", "overlap", "exact_match"]:
+        avg = metric_sums[metric] / max(total_examples, 1)
+        print(f"    {metric:15s}: {avg:.3f}")
+
+    print(f"\n  Exact matches:  {exact_matches}/{total_examples} "
+          f"({100*exact_matches/max(total_examples,1):.1f}%)")
+
+    if source_scores:
+        print(f"\n  Per-source breakdown:")
+        for source in sorted(source_scores, key=lambda s: source_scores[s]["count"], reverse=True):
+            info = source_scores[source]
+            avg = info["total_score"] / info["count"]
+            print(f"    {source}: avg_score={avg:.3f}  exact={info['exact']}/{info['count']}  n={info['count']}")
+
+    # save results
+    if args.output_jsonl:
+        with open(args.output_jsonl, "w") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"\n  Results saved to {args.output_jsonl}")
+
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

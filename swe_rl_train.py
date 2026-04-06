@@ -1,6 +1,5 @@
 import argparse
 import gc
-import json
 import os
 import re
 from dataclasses import asdict, dataclass
@@ -21,12 +20,15 @@ from trl import GRPOConfig, GRPOTrainer
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
+    dataset_config: str = "SWE-RL"
+    max_prompt_length: int = 8192
 
     # GRPO
     num_generations: int = 4
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 16
-    max_completion_length: int = 2048
+    max_completion_length: int = 4096
     learning_rate: float = 1e-6
     epsilon: float = 0.2
     temperature: float = 0.7
@@ -39,7 +41,7 @@ class TrainConfig:
     vllm_tensor_parallel_size: int = 1
 
     max_steps: int = 500
-    output_dir: str = "./ckpt_grpo_ifeval"
+    output_dir: str = "./ckpt_grpo_swe_rl"
     save_steps: int = 50
     logging_steps: int = 1
     eval_steps: int = 200
@@ -48,218 +50,90 @@ class TrainConfig:
 
     # wandb
     report_to: str = "none"
-    wandb_project: str = "grpo-ifeval"
+    wandb_project: str = "grpo-swe-rl"
     wandb_entity: str = ""
     wandb_mode: str = "online"
 
 
 # -----------------------------
-# Constraint checkers
-# -----------------------------
-def _compare(value: int, relation: str, target: int) -> bool:
-    if relation == "at least":
-        return value >= target
-    if relation == "at most":
-        return value <= target
-    if relation == "less than":
-        return value < target
-    if relation == "more than":
-        return value > target
-    if relation == "exactly":
-        return value == target
-    return True
-
-
-def check_no_comma(text: str, kw: dict) -> bool:
-    return "," not in text
-
-
-def check_number_words(text: str, kw: dict) -> bool:
-    relation = kw.get("relation")
-    num_words = kw.get("num_words")
-    if relation is None or num_words is None:
-        return True
-    return _compare(len(text.split()), relation, num_words)
-
-
-def check_number_sentences(text: str, kw: dict) -> bool:
-    relation = kw.get("relation")
-    num_sentences = kw.get("num_sentences")
-    if relation is None or num_sentences is None:
-        return True
-    count = len(re.findall(r"[.!?]+(?:\s|$)", text))
-    return _compare(count, relation, num_sentences)
-
-
-def check_number_paragraphs(text: str, kw: dict) -> bool:
-    num_paragraphs = kw.get("num_paragraphs")
-    if num_paragraphs is None:
-        return True
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    return len(paragraphs) == num_paragraphs
-
-
-def check_keywords_existence(text: str, kw: dict) -> bool:
-    keywords = kw.get("keywords")
-    if not keywords:
-        return True
-    text_lower = text.lower()
-    return all(k.lower() in text_lower for k in keywords)
-
-
-def check_forbidden_words(text: str, kw: dict) -> bool:
-    forbidden = kw.get("forbidden_words")
-    if not forbidden:
-        return True
-    text_lower = text.lower()
-    return all(w.lower() not in text_lower for w in forbidden)
-
-
-def check_keyword_frequency(text: str, kw: dict) -> bool:
-    keyword = kw.get("keyword")
-    frequency = kw.get("frequency")
-    relation = kw.get("relation")
-    if keyword is None or frequency is None or relation is None:
-        return True
-    count = text.lower().count(keyword.lower())
-    return _compare(count, relation, frequency)
-
-
-def check_english_lowercase(text: str, kw: dict) -> bool:
-    return text == text.lower()
-
-
-def check_english_capital(text: str, kw: dict) -> bool:
-    return text == text.upper()
-
-
-def check_title(text: str, kw: dict) -> bool:
-    return bool(re.match(r"^#\s", text.strip()))
-
-
-def check_number_highlighted_sections(text: str, kw: dict) -> bool:
-    num_highlights = kw.get("num_highlights")
-    if num_highlights is None:
-        return True
-    count = len(re.findall(r"(?m)^\*{2,}[^*]+\*{2,}", text))
-    if count == 0:
-        count = len(re.findall(r"(?m)^#{1,6}\s", text))
-    return _compare(count, "at least", num_highlights)
-
-
-def check_number_bullet_lists(text: str, kw: dict) -> bool:
-    num_bullets = kw.get("num_bullets")
-    if num_bullets is None:
-        return True
-    count = len(re.findall(r"(?m)^[\*\-]\s", text))
-    return _compare(count, "at least", num_bullets)
-
-
-def check_json_format(text: str, kw: dict) -> bool:
-    try:
-        json.loads(text.strip())
-        return True
-    except (json.JSONDecodeError, ValueError):
-        return False
-
-
-def check_postscript(text: str, kw: dict) -> bool:
-    marker = kw.get("postscript_marker", "P.S.")
-    if marker is None:
-        marker = "P.S."
-    return marker in text
-
-
-def check_end_checker(text: str, kw: dict) -> bool:
-    end_phrase = kw.get("end_phrase")
-    if end_phrase is None:
-        return True
-    return text.strip().endswith(end_phrase)
-
-
-def check_quotation(text: str, kw: dict) -> bool:
-    stripped = text.strip()
-    return (stripped.startswith('"') and stripped.endswith('"')) or (
-        stripped.startswith("\u201c") and stripped.endswith("\u201d")
-    )
-
-
-def check_repeat_prompt(text: str, kw: dict) -> bool:
-    prompt_to_repeat = kw.get("prompt_to_repeat")
-    if prompt_to_repeat is None:
-        return True
-    return prompt_to_repeat in text
-
-
-CHECKERS = {
-    "punctuation:no_comma": check_no_comma,
-    "length_constraints:number_words": check_number_words,
-    "length_constraints:number_sentences": check_number_sentences,
-    "length_constraints:number_paragraphs": check_number_paragraphs,
-    "keywords:existence": check_keywords_existence,
-    "keywords:forbidden_words": check_forbidden_words,
-    "keywords:frequency": check_keyword_frequency,
-    "change_case:english_lowercase": check_english_lowercase,
-    "change_case:english_capital": check_english_capital,
-    "detectable_format:title": check_title,
-    "detectable_format:number_highlighted_sections": check_number_highlighted_sections,
-    "detectable_format:number_bullet_lists": check_number_bullet_lists,
-    "detectable_format:json_format": check_json_format,
-    "detectable_content:postscript": check_postscript,
-    "startend:end_checker": check_end_checker,
-    "startend:quotation": check_quotation,
-    "combination:repeat_prompt": check_repeat_prompt,
-}
-
-
-# -----------------------------
 # Reward
 # -----------------------------
-def reward_fn(*, completions, instruction_id_list, kwargs, **_ignored) -> list[float]:
+def _extract_changed_lines(patch: str) -> set[str]:
+    lines = set()
+    for line in patch.splitlines():
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+            lines.add(line.strip())
+    return lines
+
+
+def reward_fn(completions: list[str], golden_patch: list[str], **kwargs) -> list[float]:
     rewards = []
-    for i, completion in enumerate(completions):
-        # extract text from conversational format
-        if isinstance(completion, list):
-            text = completion[-1]["content"] if completion else ""
-        else:
-            text = str(completion)
-        text = text.strip()
+    for completion, gold in zip(completions, golden_patch):
+        text = completion.strip() if isinstance(completion, str) else str(completion).strip()
+        gold = gold.strip()
 
         if not text:
             rewards.append(0.0)
             continue
 
-        ids = instruction_id_list[i]
-        kws = kwargs[i]
-        if not ids:
-            rewards.append(0.5)
-            continue
+        score = 0.0
 
-        passed = 0
-        for constraint_id, kw in zip(ids, kws):
-            checker = CHECKERS.get(constraint_id)
-            if checker is None:
-                passed += 1  # skip unknown constraints
-                continue
-            if checker(text, kw):
-                passed += 1
+        # format reward (0.2): looks like a unified diff
+        has_diff_headers = bool(re.search(r"^---\s", text, re.MULTILINE)) and bool(
+            re.search(r"^\+\+\+\s", text, re.MULTILINE)
+        )
+        has_hunks = bool(re.search(r"^@@\s", text, re.MULTILINE))
+        if has_diff_headers and has_hunks:
+            score += 0.2
+        elif has_hunks:
+            score += 0.1
 
-        rewards.append(passed / len(ids))
+        # structure reward (0.1): contains file paths and hunk markers
+        has_file_path = bool(re.search(r"[a-zA-Z_/]+\.\w+", text))
+        if has_file_path:
+            score += 0.1
+
+        # length reward (0.1): non-trivial but not excessively long
+        if 10 < len(text) < len(gold) * 5:
+            score += 0.1
+
+        # overlap reward (0.4): Jaccard similarity of changed lines
+        gen_lines = _extract_changed_lines(text)
+        gold_lines = _extract_changed_lines(gold)
+        if gen_lines and gold_lines:
+            intersection = len(gen_lines & gold_lines)
+            union = len(gen_lines | gold_lines)
+            jaccard = intersection / union if union > 0 else 0.0
+            score += 0.4 * jaccard
+
+        # exact match bonus (0.2)
+        if text.strip() == gold.strip():
+            score += 0.2
+
+        rewards.append(score)
     return rewards
 
 
 # -----------------------------
 # Dataset
 # -----------------------------
-def load_ifeval_dataset(eval_size: int = 100) -> tuple[Dataset, Dataset]:
-    ds = load_dataset("google/IFEval", split="train")
+def load_swe_rl_dataset(
+    name: str, config: str, max_prompt_length: int, tokenizer_name: str, eval_size: int = 100
+) -> tuple[Dataset, Dataset]:
+    ds = load_dataset(name, config, split="train")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     rows = []
     for example in ds:
+        prompt_text = example["prompt"]
+
+        # truncate long prompts to max_prompt_length tokens
+        tokens = tokenizer.encode(prompt_text, truncation=True, max_length=max_prompt_length)
+        prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
+
         rows.append({
-            "prompt": [{"role": "user", "content": example["prompt"]}],
-            "instruction_id_list": example["instruction_id_list"],
-            "kwargs": example["kwargs"],
+            "prompt": [{"role": "user", "content": prompt_text}],
+            "golden_patch": example["golden_patch"],
         })
 
     full = Dataset.from_list(rows)
@@ -351,11 +225,13 @@ def cleanup_compute() -> None:
 # -----------------------------
 def dry_run(cfg: TrainConfig):
     print("=" * 60)
-    print("IFEval GRPO DRY RUN")
+    print("SWE-RL GRPO DRY RUN")
     print("=" * 60)
 
     print(f"\n[Config]")
     print(f"  model:            {cfg.model_name}")
+    print(f"  dataset:          {cfg.dataset_name} ({cfg.dataset_config})")
+    print(f"  max_prompt_len:   {cfg.max_prompt_length}")
     print(f"  num_generations:  {cfg.num_generations}")
     print(f"  batch_size:       {cfg.per_device_train_batch_size}")
     print(f"  grad_accum:       {cfg.gradient_accumulation_steps}")
@@ -365,40 +241,41 @@ def dry_run(cfg: TrainConfig):
     print(f"  output_dir:       {cfg.output_dir}")
 
     print(f"\n[Dataset]")
-    train_dataset, eval_dataset = load_ifeval_dataset(cfg.eval_size)
+    train_dataset, eval_dataset = load_swe_rl_dataset(
+        cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name, cfg.eval_size
+    )
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
     dataset = train_dataset
 
-    # constraint coverage stats
+    # source distribution
     from collections import Counter
-    all_ids = []
-    for ids in dataset["instruction_id_list"]:
-        all_ids.extend(ids)
-    counts = Counter(all_ids)
-    covered = sum(c for cid, c in counts.items() if cid in CHECKERS)
-    total = sum(counts.values())
-    print(f"  total constraints: {total}")
-    print(f"  covered: {covered} ({100 * covered / total:.1f}%)")
-    print(f"  constraint types: {len(counts)}")
-    print(f"  implemented: {len(CHECKERS)}")
-    print(f"\n  Top constraints:")
-    for cid, count in counts.most_common(10):
-        tag = "✓" if cid in CHECKERS else "✗"
-        print(f"    {tag} {cid}: {count}")
+    sources = Counter()
+    for row in dataset:
+        # source info is lost after processing, show golden_patch stats instead
+        patch = row["golden_patch"]
+        sources[len(patch) < 500] += 1
+    print(f"  short patches (<500 chars): {sources.get(True, 0)}")
+    print(f"  long patches (>=500 chars): {sources.get(False, 0)}")
+
+    first = dataset[0]
+    prompt_preview = first["prompt"][0]["content"][:150]
+    print(f"\n  First prompt preview: {prompt_preview}...")
+    print(f"  First golden_patch preview: {first['golden_patch'][:150]}...")
 
     print(f"\n[Reward function test]")
-    # test with a synthetic completion against the first example
-    first = dataset[0]
-    print(f"  Prompt: {first['prompt'][0]['content'][:100]}...")
-    print(f"  Constraints: {first['instruction_id_list']}")
-    test_completions = [[{"role": "assistant", "content": "This is a test response."}]]
-    test_rewards = reward_fn(
-        completions=test_completions,
-        instruction_id_list=[first["instruction_id_list"]],
-        kwargs=[first["kwargs"]],
-    )
-    print(f"  Test reward: {test_rewards[0]:.2f}")
+    # test with a synthetic diff-like completion
+    test_completions = [
+        "",
+        "Some random text that is not a patch.",
+        "--- a/file.py\n+++ b/file.py\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context",
+        first["golden_patch"],  # exact match test
+    ]
+    test_golden = [first["golden_patch"]] * len(test_completions)
+    test_rewards = reward_fn(completions=test_completions, golden_patch=test_golden)
+    labels = ["empty", "random text", "synthetic diff", "exact match"]
+    for label, comp, rew in zip(labels, test_completions, test_rewards):
+        print(f"  {rew:.2f} <- {label}: {repr(comp[:60])}")
 
     print(f"\n[Tokenizer]")
     try:
@@ -418,7 +295,7 @@ def dry_run(cfg: TrainConfig):
 # Main
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="IFEval GRPO training for instruction following")
+    parser = argparse.ArgumentParser(description="SWE-RL GRPO training for coding agent")
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
     parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
@@ -451,7 +328,9 @@ def main():
         return
 
     # load dataset
-    train_dataset, eval_dataset = load_ifeval_dataset(cfg.eval_size)
+    train_dataset, eval_dataset = load_swe_rl_dataset(
+        cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name, cfg.eval_size
+    )
     print(f"Train dataset: {len(train_dataset)} examples")
     if eval_dataset:
         print(f"Eval dataset: {len(eval_dataset)} examples (every {cfg.eval_steps} steps)")
@@ -459,7 +338,7 @@ def main():
     # training config
     model_short = cfg.model_name.split("/")[-1]
     run_name = (
-        f"ifeval_{model_short}"
+        f"swe_rl_{model_short}"
         f"_g{cfg.num_generations}"
         f"_bs{cfg.per_device_train_batch_size}"
         f"_ga{cfg.gradient_accumulation_steps}"
