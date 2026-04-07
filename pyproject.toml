@@ -12,6 +12,7 @@ dependencies = [
     "pyyaml",
     "datasets",
     "accelerate",
-    "huggingface-hub",
+    "huggingface_hub",
     "wandb",
+    "python-dotenv>=1.2.2",
 ]
