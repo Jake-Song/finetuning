@@ -16,6 +16,7 @@
 
 import argparse
 import gc
+import json
 import os
 import re
 from dataclasses import asdict, dataclass
@@ -40,15 +41,15 @@ load_dotenv()
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
-    dataset_config: str = "SWE-RL"
+    dataset_config: str = "multi-domain-RL"
     max_prompt_length: int = 2048
 
     # GRPO
     num_generations: int = 4
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 16
-    max_completion_length: int = 4096
-    learning_rate: float = 1e-6
+    max_completion_length: int = 2048
+    learning_rate: float = 3e-6
     epsilon: float = 0.2
     temperature: float = 0.7
     warmup_steps: int = 10
@@ -60,7 +61,7 @@ class TrainConfig:
     vllm_tensor_parallel_size: int = 1
 
     max_steps: int = 500
-    output_dir: str = "./ckpt_grpo_swe_rl"
+    output_dir: str = "./ckpt_grpo_multi_domain"
     save_steps: int = 50
     logging_steps: int = 1
     eval_steps: int = 200
@@ -69,7 +70,7 @@ class TrainConfig:
 
     # wandb
     report_to: str = "none"
-    wandb_project: str = "grpo-swe-rl"
+    wandb_project: str = "grpo-multi-domain"
     wandb_entity: str = ""
     wandb_mode: str = "online"
 
@@ -77,66 +78,157 @@ class TrainConfig:
 # -----------------------------
 # Reward
 # -----------------------------
-def _extract_changed_lines(patch: str) -> set[str]:
-    lines = set()
-    for line in patch.splitlines():
-        if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-            lines.add(line.strip())
-    return lines
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip()).lower()
 
 
-def reward_fn(completions: list[str], golden_patch: list[str], **kwargs) -> list[float]:
+def _check_mcqa(completion: str, expected: str) -> float:
+    # extract answer letter from completion (e.g. "A", "B", "C", "D")
+    expected_norm = expected.strip().upper()
+    # try to find a clear answer pattern like "Answer: B" or "(B)" or just the letter
+    patterns = [
+        r"(?:answer|choice)\s*(?:is|:)\s*\(?([A-Z])\)?",
+        r"\b([A-Z])\)",
+        r"^\s*\(?([A-Z])\)?\s*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, completion, re.IGNORECASE | re.MULTILINE)
+        if m and m.group(1).upper() == expected_norm:
+            return 1.0
+    # fallback: check if expected answer appears in completion
+    if expected_norm in completion.upper().split():
+        return 0.5
+    return 0.0
+
+
+def _check_tool_call(completion: str, ground_truth: list[dict]) -> float:
+    if not ground_truth:
+        return 0.5
+    # try to parse function calls from completion
+    try:
+        parsed = json.loads(completion.strip())
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+    except (json.JSONDecodeError, ValueError):
+        # try to extract JSON from the completion
+        m = re.search(r"\{.*\}", completion, re.DOTALL)
+        if m:
+            try:
+                parsed = [json.loads(m.group())]
+            except (json.JSONDecodeError, ValueError):
+                return 0.0
+        else:
+            return 0.0
+
+    if not parsed:
+        return 0.0
+
+    # score each ground truth call
+    total = len(ground_truth)
+    matched = 0
+    for gt in ground_truth:
+        gt_name = gt.get("name", "")
+        gt_args = gt.get("arguments", {})
+        if isinstance(gt_args, str):
+            try:
+                gt_args = json.loads(gt_args)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for call in parsed:
+            call_name = call.get("name", "") or call.get("function", "")
+            call_args = call.get("arguments", {}) or call.get("parameters", {})
+            if isinstance(call_args, str):
+                try:
+                    call_args = json.loads(call_args)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            if _normalize(call_name) == _normalize(gt_name):
+                if call_args == gt_args:
+                    matched += 1
+                else:
+                    matched += 0.5
+                break
+    return matched / total
+
+
+def _check_structured_output(completion: str, expected: str) -> float:
+    # validate that completion is valid JSON
+    try:
+        parsed = json.loads(completion.strip())
+    except (json.JSONDecodeError, ValueError):
+        # try to extract JSON block
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", completion)
+        if m:
+            try:
+                parsed = json.loads(m.group(1).strip())
+            except (json.JSONDecodeError, ValueError):
+                return 0.0
+        else:
+            return 0.0
+
+    score = 0.5  # valid JSON
+
+    # compare with expected if available
+    if expected:
+        try:
+            expected_parsed = json.loads(expected.strip())
+            if parsed == expected_parsed:
+                score = 1.0
+            elif isinstance(parsed, type(expected_parsed)):
+                score = 0.7
+        except (json.JSONDecodeError, ValueError):
+            if _normalize(str(parsed)) == _normalize(expected):
+                score = 1.0
+
+    return score
+
+
+def _detect_category(category: str) -> str:
+    cat = (category or "").lower()
+    if "tool" in cat or "function" in cat or "agent" in cat:
+        return "tool_call"
+    if "struct" in cat or "json" in cat or "schema" in cat:
+        return "structured"
+    return "mcqa"
+
+
+def reward_fn(
+    completions: list[str],
+    expected_answer: list[str],
+    category: list[str],
+    ground_truth: list,
+    **kwargs,
+) -> list[float]:
     rewards = []
-    for completion, gold in zip(completions, golden_patch):
-        text = completion.strip() if isinstance(completion, str) else str(completion).strip()
-        gold = gold.strip()
+    for i, completion in enumerate(completions):
+        if isinstance(completion, list):
+            text = completion[-1]["content"] if completion else ""
+        else:
+            text = str(completion)
+        text = text.strip()
 
         if not text:
             rewards.append(0.0)
             continue
 
-        score = 0.0
+        cat = _detect_category(category[i])
+        expected = expected_answer[i] or ""
+        gt = ground_truth[i] or []
 
-        # format reward (0.2): looks like a unified diff
-        has_diff_headers = bool(re.search(r"^---\s", text, re.MULTILINE)) and bool(
-            re.search(r"^\+\+\+\s", text, re.MULTILINE)
-        )
-        has_hunks = bool(re.search(r"^@@\s", text, re.MULTILINE))
-        if has_diff_headers and has_hunks:
-            score += 0.2
-        elif has_hunks:
-            score += 0.1
+        if cat == "tool_call":
+            rewards.append(_check_tool_call(text, gt))
+        elif cat == "structured":
+            rewards.append(_check_structured_output(text, expected))
+        else:
+            rewards.append(_check_mcqa(text, expected))
 
-        # structure reward (0.1): contains file paths and hunk markers
-        has_file_path = bool(re.search(r"[a-zA-Z_/]+\.\w+", text))
-        if has_file_path:
-            score += 0.1
-
-        # length reward (0.1): non-trivial but not excessively long
-        if 10 < len(text) < len(gold) * 5:
-            score += 0.1
-
-        # overlap reward (0.4): Jaccard similarity of changed lines
-        gen_lines = _extract_changed_lines(text)
-        gold_lines = _extract_changed_lines(gold)
-        if gen_lines and gold_lines:
-            intersection = len(gen_lines & gold_lines)
-            union = len(gen_lines | gold_lines)
-            jaccard = intersection / union if union > 0 else 0.0
-            score += 0.4 * jaccard
-
-        # exact match bonus (0.2)
-        if text.strip() == gold.strip():
-            score += 0.2
-
-        rewards.append(score)
     return rewards
 
 
 # -----------------------------
 # Dataset
 # -----------------------------
-def load_swe_rl_dataset(
+def load_multi_domain_dataset(
     name: str, config: str, max_prompt_length: int, tokenizer_name: str, eval_size: int = 100
 ) -> tuple[Dataset, Dataset]:
     ds = load_dataset(name, config, split="train")
@@ -144,25 +236,25 @@ def load_swe_rl_dataset(
 
     rows = []
     for example in ds:
-        prompt_text = example.get("prompt") or example.get("problem_statement")
-        golden_patch = example.get("golden_patch") or example.get("patch")
-        if not prompt_text or not golden_patch:
-            # Skip malformed records instead of failing the entire run.
+        prompt_text = example.get("prompt") or example.get("question") or ""
+        if not prompt_text:
             continue
 
-        # truncate long prompts to max_prompt_length tokens
+        # truncate long prompts
         tokens = tokenizer.encode(prompt_text, truncation=True, max_length=max_prompt_length)
         prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
 
         rows.append({
             "prompt": [{"role": "user", "content": prompt_text}],
-            "golden_patch": golden_patch,
+            "expected_answer": example.get("expected_answer", "") or "",
+            "category": example.get("category", "") or "",
+            "ground_truth": example.get("ground_truth") or [],
         })
 
     if not rows:
         raise ValueError(
             f"No usable rows found in dataset {name}/{config}. "
-            "Expected prompt+patch fields like (prompt, golden_patch) or (problem_statement, patch)."
+            "Expected at least a prompt or question field."
         )
 
     full = Dataset.from_list(rows)
@@ -175,7 +267,6 @@ def load_swe_rl_dataset(
 # -----------------------------
 # wandb helpers
 # -----------------------------
-
 def _is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -183,6 +274,7 @@ def _is_main_process() -> bool:
 def _wandb_enabled(report_to: str) -> bool:
     targets = {target.strip().lower() for target in report_to.split(",")}
     return "wandb" in targets
+
 
 def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
     if not _wandb_enabled(cfg.report_to) or not _is_main_process():
@@ -201,9 +293,6 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
 
     api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
 
-    # Never call wandb.login() without a key: relogin=True alone triggers interactive auth and
-    # raises UsageError in CI/containers. With a key, login explicitly; otherwise rely on
-    # stored credentials or offline mode.
     wandb_mode = cfg.wandb_mode
     if not api_key and str(wandb_mode).lower() == "online":
         print(
@@ -252,7 +341,6 @@ class EvalLogCallback(TrainerCallback):
         step = state.global_step
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # write header on first eval
         write_header = not os.path.exists(self.log_path)
         with open(self.log_path, "a") as f:
             if write_header:
@@ -279,12 +367,8 @@ def cleanup_compute() -> None:
 # Dry run
 # -----------------------------
 def dry_run(cfg: TrainConfig):
-    if os.environ.get("WANDB_API_KEY"):
-        print("WANDB_API_KEY is set")
-    else:
-        print("WANDB_API_KEY is not set")
     print("=" * 60)
-    print("SWE-RL GRPO DRY RUN")
+    print("Multi-Domain RL GRPO DRY RUN")
     print("=" * 60)
 
     print(f"\n[Config]")
@@ -300,41 +384,40 @@ def dry_run(cfg: TrainConfig):
     print(f"  output_dir:       {cfg.output_dir}")
 
     print(f"\n[Dataset]")
-    train_dataset, eval_dataset = load_swe_rl_dataset(
+    train_dataset, eval_dataset = load_multi_domain_dataset(
         cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name, cfg.eval_size
     )
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
-    dataset = train_dataset
 
-    # source distribution
+    # category distribution
     from collections import Counter
-    sources = Counter()
-    for row in dataset:
-        # source info is lost after processing, show golden_patch stats instead
-        patch = row["golden_patch"]
-        sources[len(patch) < 500] += 1
-    print(f"  short patches (<500 chars): {sources.get(True, 0)}")
-    print(f"  long patches (>=500 chars): {sources.get(False, 0)}")
+    cats = Counter()
+    for row in train_dataset:
+        cats[_detect_category(row["category"])] += 1
+    print(f"\n  Category distribution:")
+    for cat, count in cats.most_common():
+        print(f"    {cat}: {count}")
 
-    first = dataset[0]
-    prompt_preview = first["prompt"][0]["content"][:150]
-    print(f"\n  First prompt preview: {prompt_preview}...")
-    print(f"  First golden_patch preview: {first['golden_patch'][:150]}...")
+    first = train_dataset[0]
+    print(f"\n  First prompt preview: {first['prompt'][0]['content'][:150]}...")
+    print(f"  First expected_answer: {first['expected_answer'][:100]}")
+    print(f"  First category: {first['category']}")
 
     print(f"\n[Reward function test]")
-    # test with a synthetic diff-like completion
-    test_completions = [
-        "",
-        "Some random text that is not a patch.",
-        "--- a/file.py\n+++ b/file.py\n@@ -1,3 +1,3 @@\n-old line\n+new line\n context",
-        first["golden_patch"],  # exact match test
-    ]
-    test_golden = [first["golden_patch"]] * len(test_completions)
-    test_rewards = reward_fn(completions=test_completions, golden_patch=test_golden)
-    labels = ["empty", "random text", "synthetic diff", "exact match"]
-    for label, comp, rew in zip(labels, test_completions, test_rewards):
-        print(f"  {rew:.2f} <- {label}: {repr(comp[:60])}")
+    test_completions = ["", "Answer: B", '{"name": "search", "arguments": {"query": "test"}}']
+    test_expected = ["B", "B", ""]
+    test_cats = ["mcqa", "mcqa", "tool_call"]
+    test_gt: list = [[], [], [{"name": "search", "arguments": {"query": "test"}}]]
+    test_rewards = reward_fn(
+        completions=test_completions,
+        expected_answer=test_expected,
+        category=test_cats,
+        ground_truth=test_gt,
+    )
+    labels = ["empty", "correct mcqa", "exact tool call"]
+    for label, rew in zip(labels, test_rewards):
+        print(f"  {rew:.2f} <- {label}")
 
     print(f"\n[Tokenizer]")
     try:
@@ -354,13 +437,13 @@ def dry_run(cfg: TrainConfig):
 # Main
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="SWE-RL GRPO training for coding agent")
+    parser = argparse.ArgumentParser(description="Multi-Domain RL GRPO training")
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
     parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
-    parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps (default: 50)")
-    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples (default: 100)")
+    parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps")
+    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples")
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -387,7 +470,7 @@ def main():
         return
 
     # load dataset
-    train_dataset, eval_dataset = load_swe_rl_dataset(
+    train_dataset, eval_dataset = load_multi_domain_dataset(
         cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name, cfg.eval_size
     )
     print(f"Train dataset: {len(train_dataset)} examples")
@@ -397,7 +480,7 @@ def main():
     # training config
     model_short = cfg.model_name.split("/")[-1]
     run_name = (
-        f"swe_rl_{model_short}"
+        f"multi_domain_{model_short}"
         f"_g{cfg.num_generations}"
         f"_bs{cfg.per_device_train_batch_size}"
         f"_ga{cfg.gradient_accumulation_steps}"
@@ -422,7 +505,7 @@ def main():
         lr_scheduler_type=cfg.lr_scheduler_type,
         weight_decay=cfg.weight_decay,
         gradient_checkpointing=True,
-        loss_type="dapo",
+        loss_type="grpo",
         mask_truncated_completions=True,
         optim="adamw_torch_fused",
         bf16=True,

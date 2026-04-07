@@ -1,3 +1,19 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#      "torch==2.9.1",
+#     "trl[vllm]",
+#     "aiohttp",
+#     "omegaconf",
+#     "pyyaml",
+#     "datasets",
+#     "accelerate",
+#     "huggingface-hub",
+#     "wandb",
+#     "python-dotenv>=1.2.2",
+# ]
+# ///
+
 import argparse
 import gc
 import json
@@ -14,7 +30,8 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer, TrainerCallback
 
 from trl import GRPOConfig, GRPOTrainer
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # -----------------------------
 # Config
@@ -22,6 +39,9 @@ from trl import GRPOConfig, GRPOTrainer
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
+    dataset_config: str = "IF-RL"
+    max_prompt_length: int = 2048
 
     # GRPO
     num_generations: int = 4
@@ -252,9 +272,9 @@ def reward_fn(*, completions, instruction_id_list, kwargs, **_ignored) -> list[f
 # -----------------------------
 # Dataset
 # -----------------------------
-def load_ifeval_dataset(eval_size: int = 100) -> tuple[Dataset, Dataset]:
-    ds = load_dataset("google/IFEval", split="train")
-
+def load_ifeval_dataset(cfg: TrainConfig, eval_size: int = 100) -> tuple[Dataset, Dataset]:
+    ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split="train")
+    
     rows = []
     for example in ds:
         rows.append({
@@ -273,9 +293,6 @@ def load_ifeval_dataset(eval_size: int = 100) -> tuple[Dataset, Dataset]:
 # -----------------------------
 # wandb helpers
 # -----------------------------
-ENV_YAML_PATH = os.path.join(os.path.dirname(__file__), "env.yaml")
-
-
 def _is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -283,13 +300,6 @@ def _is_main_process() -> bool:
 def _wandb_enabled(report_to: str) -> bool:
     targets = {target.strip().lower() for target in report_to.split(",")}
     return "wandb" in targets
-
-
-def _load_env_yaml() -> dict:
-    if not os.path.exists(ENV_YAML_PATH):
-        return {}
-    with open(ENV_YAML_PATH) as f:
-        return yaml.safe_load(f) or {}
 
 
 def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
@@ -306,20 +316,30 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
     if cfg.wandb_entity:
         os.environ["WANDB_ENTITY"] = cfg.wandb_entity
-    os.environ["WANDB_MODE"] = cfg.wandb_mode
 
-    env = _load_env_yaml()
-    api_key = env.get("wandb_api_key", "") or os.environ.get("WANDB_API_KEY", "")
-    login_kwargs: dict[str, Any] = {"relogin": True}
+    api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
+
+    # Never call wandb.login() without a key: relogin=True alone triggers interactive auth and
+    # raises UsageError in CI/containers. With a key, login explicitly; otherwise rely on
+    # stored credentials or offline mode.
+    wandb_mode = cfg.wandb_mode
+    if not api_key and str(wandb_mode).lower() == "online":
+        print(
+            "W&B: no API key (set WANDB_API_KEY); "
+            "using offline mode. Logs are written under wandb/ locally."
+        )
+        wandb_mode = "offline"
+
+    os.environ["WANDB_MODE"] = wandb_mode
+
     if api_key:
-        login_kwargs["key"] = api_key
-    wandb.login(**login_kwargs)
+        wandb.login(key=api_key, relogin=True)
 
     if wandb.run is None:
         init_kwargs: dict[str, Any] = {
             "project": cfg.wandb_project,
             "name": run_name,
-            "mode": cfg.wandb_mode,
+            "mode": wandb_mode,
             "config": asdict(cfg),
         }
         if cfg.wandb_entity:
@@ -392,7 +412,7 @@ def dry_run(cfg: TrainConfig):
     print(f"  output_dir:       {cfg.output_dir}")
 
     print(f"\n[Dataset]")
-    train_dataset, eval_dataset = load_ifeval_dataset(cfg.eval_size)
+    train_dataset, eval_dataset = load_ifeval_dataset(cfg, cfg.eval_size)
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
     dataset = train_dataset
@@ -478,7 +498,7 @@ def main():
         return
 
     # load dataset
-    train_dataset, eval_dataset = load_ifeval_dataset(cfg.eval_size)
+    train_dataset, eval_dataset = load_ifeval_dataset(cfg, cfg.eval_size)
     print(f"Train dataset: {len(train_dataset)} examples")
     if eval_dataset:
         print(f"Eval dataset: {len(eval_dataset)} examples (every {cfg.eval_steps} steps)")
