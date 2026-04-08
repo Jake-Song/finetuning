@@ -38,10 +38,10 @@ load_dotenv()
 # -----------------------------
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name: str = "Qwen/Qwen3.5-2B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "IF-RL"
-    max_prompt_length: int = 2048
+    max_prompt_length: int = 1024
 
     # GRPO
     num_generations: int = 4
@@ -471,7 +471,7 @@ def main():
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
     parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps (default: 50)")
-    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples (default: 100)")
+    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples (default: 200)")
     args = parser.parse_args()
 
     cfg = TrainConfig()
