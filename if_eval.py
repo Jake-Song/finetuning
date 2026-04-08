@@ -8,7 +8,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from if_train import CHECKERS
+from if_train import CHECKERS, TrainConfig
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -18,8 +18,10 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
-def load_ifeval_examples() -> list[dict]:
-    ds = load_dataset("google/IFEval", split="train")
+def load_eval_examples(dataset_name: str | None = None, dataset_config: str | None = None) -> list[dict]:
+    name = dataset_name or TrainConfig.dataset_name
+    config = dataset_config or TrainConfig.dataset_config
+    ds = load_dataset(name, config, split="train")
     return list(ds)
 
 
@@ -54,8 +56,27 @@ def evaluate_constraints(text: str, instruction_ids: list[str], kwargs_list: lis
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained model on IFEval constraints")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained model on instruction-following constraints (Nemotron IF-RL by default)"
+    )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help=f"HF dataset id (default: {TrainConfig.dataset_name})",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=None,
+        help=f"HF dataset config name (default: {TrainConfig.dataset_config})",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=f"Model checkpoint path (default: base model {TrainConfig.model_name})",
+    )
     parser.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path (defaults to checkpoint)")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -88,16 +109,20 @@ def main():
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     # load model
-    print(f"Loading model from {args.checkpoint} (device={device}, dtype={dtype})")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.checkpoint)
+    model_path = args.checkpoint or TrainConfig.model_name
+    print(f"Loading model from {model_path} (device={device}, dtype={dtype})")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.checkpoint, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
     model.to(device)
     model.eval()
 
     # load dataset
-    examples = load_ifeval_examples()
+    ds_name = args.dataset_name or TrainConfig.dataset_name
+    ds_config = args.dataset_config or TrainConfig.dataset_config
+    print(f"Loading eval data: {ds_name} ({ds_config})")
+    examples = load_eval_examples(args.dataset_name, args.dataset_config)
     if args.max_examples:
         examples = examples[:args.max_examples]
     print(f"Evaluating on {len(examples)} examples, {num_samples} sample(s) each")
@@ -180,7 +205,7 @@ def main():
     # final report
     elapsed = time.time() - started
     print(f"\n{'='*60}")
-    print(f"IFEval Results: {args.checkpoint}")
+    print(f"Results ({ds_name}/{ds_config}): {model_path}")
     print(f"{'='*60}")
     print(f"  Examples:           {total_examples}")
     print(f"  Samples/example:    {num_samples}")

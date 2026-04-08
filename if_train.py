@@ -63,8 +63,8 @@ class TrainConfig:
     output_dir: str = "./ckpt_grpo_ifeval"
     save_steps: int = 50
     logging_steps: int = 1
-    eval_steps: int = 200
-    eval_size: int = 100
+    eval_steps: int = 50
+    eval_size: int = 200
     seed: int = 42
 
     # wandb
@@ -531,7 +531,7 @@ def main():
         lr_scheduler_type=cfg.lr_scheduler_type,
         weight_decay=cfg.weight_decay,
         gradient_checkpointing=True,
-        loss_type="grpo",
+        loss_type="dapo",
         mask_truncated_completions=True,
         optim="adamw_torch_fused",
         bf16=True,
