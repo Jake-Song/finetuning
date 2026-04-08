@@ -16,3 +16,10 @@ dependencies = [
     "wandb",
     "python-dotenv>=1.2.2",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tasks", "scripts"]   # list each folder

@@ -38,7 +38,7 @@ load_dotenv()
 # -----------------------------
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen3.5-2B-Instruct"
+    model_name: str = "Qwen/Qwen3.5-2B"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "IF-RL"
     max_prompt_length: int = 1024
