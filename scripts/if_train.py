@@ -46,6 +46,7 @@ from utils.common import (
     DummyWandb,
     autodetect_device_type,
 )
+from utils.vllm_sync import sync_vllm_model_weights
 
 
 # -----------------------------------------------------------------------------
@@ -596,9 +597,7 @@ def main():
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         # 1) Sync training weights into vLLM engine
-        llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
-            raw_model.named_parameters(),
-        )
+        sync_vllm_model_weights(llm, raw_model)
 
         # 2) Generate completions via vLLM
         all_ids, all_masks, completions_text = generate_completions(
