@@ -5,11 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.9.1",
+    "torch==2.10.0",
     "transformers",
     "datasets",
     "pyyaml",
-    "vllm",
+    "vllm>=0.19.0",
     "wandb",
     "python-dotenv>=1.2.2",
     "huggingface_hub"
