@@ -6,7 +6,8 @@
 #     "datasets",
 #     "wandb",
 #     "pyyaml",
-#     "vllm",
+#     "vllm>=0.19.0",
+#     "openai",
 # ]
 # ///
 
@@ -29,8 +30,6 @@ import os
 import re
 from dataclasses import asdict, dataclass
 
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -39,7 +38,6 @@ import yaml
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm import LLM, SamplingParams
 
 from utils.common import (
     compute_init,
@@ -48,7 +46,7 @@ from utils.common import (
     DummyWandb,
     autodetect_device_type,
 )
-from utils.vllm_sync import sync_vllm_model_weights
+from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model_weights
 
 
 # -----------------------------------------------------------------------------
@@ -56,24 +54,30 @@ from utils.vllm_sync import sync_vllm_model_weights
 # -----------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen3.5-2B"
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "IF-RL"
-    max_prompt_length: int = 1024
+    max_prompt_length: int = 256
 
     # GRPO
     num_generations: int = 4
-    max_completion_length: int = 2048
+    max_completion_length: int = 256
     temperature: float = 0.7
     top_p: float = 1.0
 
-    # vLLM
-    vllm_gpu_memory_utilization: float = 0.3
-    vllm_dtype: str = "bfloat16"
+    # vLLM server
+    vllm_server_host: str = "127.0.0.1"
+    vllm_server_port: int = 8000
+    vllm_model_name_for_requests: str = ""
+    vllm_api_key: str = "EMPTY"
+    vllm_request_timeout: float = 300.0
+    vllm_sync_timeout: float = 300.0
+    vllm_weight_sync_backend: str = "nccl"
+    vllm_max_parallel_requests: int = 8
 
     # Optimization
-    batch_size: int = 128
-    per_device_batch_size: int = 4
+    batch_size: int = 16
+    per_device_batch_size: int = 8
     learning_rate: float = 1e-6
     warmup_steps: int = 10
     init_lr_frac: float = 0.1
@@ -305,49 +309,18 @@ def load_ifeval_dataset(cfg: TrainConfig, eval_size: int = 100) -> tuple[Dataset
 # Generation (vLLM)
 # -----------------------------------------------------------------------------
 def generate_completions(
-    llm: LLM, tokenizer, prompts: list[str], *,
+    rollout_client: OpenAICompatibleRolloutClient, tokenizer, prompts: list[str], *,
     max_new_tokens: int, temperature: float, top_p: float,
     num_generations: int,
 ) -> tuple[list[list[int]], list[list[int]], list[str]]:
-    """
-    Generate completions using vLLM. Returns (all_input_ids, all_completion_masks, all_texts)
-    where each entry corresponds to one (prompt, generation) pair.
-    Each input_ids is the full sequence (prompt + completion).
-    Each completion_mask has 1 for completion tokens, 0 for prompt tokens.
-    all_texts contains the decoded completion strings.
-    """
-    sampling_params = SamplingParams(
-        n=num_generations,
-        temperature=temperature if temperature > 0 else 1.0,
+    return rollout_client.generate_completions(
+        tokenizer,
+        list(prompts),
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
         top_p=top_p,
-        max_tokens=max_new_tokens,
+        num_generations=num_generations,
     )
-
-    # Format prompts with chat template
-    formatted = []
-    for prompt in prompts:
-        messages = [{"role": "user", "content": prompt}]
-        formatted.append(tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        ))
-
-    outputs = llm.generate(formatted, sampling_params)
-
-    all_input_ids = []
-    all_completion_masks = []
-    all_texts = []
-    for output in outputs:
-        prompt_ids = list(output.prompt_token_ids)
-        prompt_len = len(prompt_ids)
-        for completion in output.outputs:
-            comp_ids = list(completion.token_ids)
-            seq_ids = prompt_ids + comp_ids
-            mask = [0] * prompt_len + [1] * len(comp_ids)
-            all_input_ids.append(seq_ids)
-            all_completion_masks.append(mask)
-            all_texts.append(completion.text)
-
-    return all_input_ids, all_completion_masks, all_texts
 
 
 # -----------------------------------------------------------------------------
@@ -417,7 +390,8 @@ def dry_run(cfg: TrainConfig):
     print(f"  max_completion:   {cfg.max_completion_length}")
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
-    print(f"  vllm_gpu_util:    {cfg.vllm_gpu_memory_utilization}")
+    print(f"  vllm_server:      {cfg.vllm_server_host}:{cfg.vllm_server_port}")
+    print(f"  vllm_sync:        {cfg.vllm_weight_sync_backend}")
     print(f"  output_dir:       {cfg.output_dir}")
 
     print(f"\n[Dataset]")
@@ -481,6 +455,13 @@ def main():
     parser.add_argument("--num-generations", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--vllm-server-host", type=str, default=None)
+    parser.add_argument("--vllm-server-port", type=int, default=None)
+    parser.add_argument("--vllm-model-name", type=str, default=None)
+    parser.add_argument("--vllm-api-key", type=str, default=None)
+    parser.add_argument("--vllm-request-timeout", type=float, default=None)
+    parser.add_argument("--vllm-sync-timeout", type=float, default=None)
+    parser.add_argument("--vllm-weight-sync-backend", type=str, default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -501,6 +482,20 @@ def main():
         cfg.max_steps = args.max_steps
     if args.lr is not None:
         cfg.learning_rate = args.lr
+    if args.vllm_server_host is not None:
+        cfg.vllm_server_host = args.vllm_server_host
+    if args.vllm_server_port is not None:
+        cfg.vllm_server_port = args.vllm_server_port
+    if args.vllm_model_name is not None:
+        cfg.vllm_model_name_for_requests = args.vllm_model_name
+    if args.vllm_api_key is not None:
+        cfg.vllm_api_key = args.vllm_api_key
+    if args.vllm_request_timeout is not None:
+        cfg.vllm_request_timeout = args.vllm_request_timeout
+    if args.vllm_sync_timeout is not None:
+        cfg.vllm_sync_timeout = args.vllm_sync_timeout
+    if args.vllm_weight_sync_backend is not None:
+        cfg.vllm_weight_sync_backend = args.vllm_weight_sync_backend
 
     if args.dry_run:
         dry_run(cfg)
@@ -539,13 +534,18 @@ def main():
         )
     raw_model = model.module if ddp else model
 
-    # vLLM inference engine (shares GPU with training model)
-    print0(f"Loading vLLM engine: {cfg.model_name}...")
-    llm = LLM(
-        model=cfg.model_name,
-        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-        dtype=cfg.vllm_dtype,
-        enable_prefix_caching=True,
+    request_model_name = cfg.vllm_model_name_for_requests or cfg.model_name
+    print0(
+        f"Connecting to vLLM server at {cfg.vllm_server_host}:{cfg.vllm_server_port} "
+        f"(model={request_model_name})..."
+    )
+    rollout_client = OpenAICompatibleRolloutClient(
+        host=cfg.vllm_server_host,
+        port=cfg.vllm_server_port,
+        model_name=request_model_name,
+        api_key=cfg.vllm_api_key,
+        request_timeout=cfg.vllm_request_timeout,
+        max_parallel_requests=cfg.vllm_max_parallel_requests,
     )
 
     # Dataset
@@ -599,11 +599,20 @@ def main():
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         # 1) Sync training weights into vLLM engine
-        sync_vllm_model_weights(llm, raw_model)
+        sync_server_model_weights(
+            host=cfg.vllm_server_host,
+            port=cfg.vllm_server_port,
+            model=raw_model,
+            backend=cfg.vllm_weight_sync_backend,
+            timeout=cfg.vllm_sync_timeout,
+            is_sync_leader=master_process,
+        )
+        if ddp:
+            dist.barrier()
 
         # 2) Generate completions via vLLM
         all_ids, all_masks, completions_text = generate_completions(
-            llm, tokenizer, prompts,
+            rollout_client, tokenizer, prompts,
             max_new_tokens=cfg.max_completion_length,
             temperature=cfg.temperature, top_p=cfg.top_p,
             num_generations=cfg.num_generations,
