@@ -6,15 +6,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.1",
-    "trl[vllm]",
-    "aiohttp",
-    "omegaconf",
-    "pyyaml",
+    "transformers",
     "datasets",
-    "accelerate",
-    "huggingface_hub",
+    "pyyaml",
+    "vllm",
     "wandb",
     "python-dotenv>=1.2.2",
+    "huggingface_hub"
 ]
 
 [build-system]

@@ -1,41 +1,56 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#      "torch==2.9.1",
-#     "trl[vllm]",
-#     "aiohttp",
-#     "omegaconf",
-#     "pyyaml",
+#     "torch==2.9.1",
+#     "transformers",
 #     "datasets",
-#     "accelerate",
-#     "huggingface-hub",
 #     "wandb",
-#     "python-dotenv>=1.2.2",
+#     "pyyaml",
+#     "vllm",
 # ]
 # ///
 
+"""
+IFEval GRPO training in native PyTorch.
+
+Trains a model to follow instruction constraints (word count, formatting, keywords, etc.)
+using Group Relative Policy Optimization with the Nemotron-Cascade-2 IF-RL dataset.
+
+Usage:
+  Single GPU:   uv run scripts/if_train.py
+  Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/if_train.py
+  Dry run:      uv run scripts/if_train.py --dry-run
+"""
+
 import argparse
-import gc
 import json
+import math
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
-from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+import wandb
 import yaml
 from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer, TrainerCallback
+from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
 
-from trl import GRPOConfig, GRPOTrainer
-from dotenv import load_dotenv
-load_dotenv()
+from utils.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    DummyWandb,
+    autodetect_device_type,
+)
 
-# -----------------------------
+
+# -----------------------------------------------------------------------------
 # Config
-# -----------------------------
+# -----------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen3.5-2B"
@@ -45,38 +60,37 @@ class TrainConfig:
 
     # GRPO
     num_generations: int = 4
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 16
     max_completion_length: int = 2048
-    learning_rate: float = 1e-6
-    epsilon: float = 0.2
     temperature: float = 0.7
-    warmup_steps: int = 10
-    lr_scheduler_type: str = "linear"
-    weight_decay: float = 0.0
+    top_p: float = 1.0
 
-    # vLLM (colocated mode)
+    # vLLM
     vllm_gpu_memory_utilization: float = 0.3
-    vllm_tensor_parallel_size: int = 1
+    vllm_dtype: str = "bfloat16"
+
+    # Optimization
+    batch_size: int = 128
+    per_device_batch_size: int = 4
+    learning_rate: float = 1e-6
+    warmup_steps: int = 10
+    init_lr_frac: float = 0.1
+    weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
 
     max_steps: int = 500
     output_dir: str = "./ckpt_grpo_ifeval"
-    save_steps: int = 50
-    logging_steps: int = 1
-    eval_steps: int = 50
+    save_every: int = 50
+    log_every: int = 1
     eval_size: int = 200
     seed: int = 42
 
     # wandb
-    report_to: str = "none"
-    wandb_project: str = "grpo-ifeval"
-    wandb_entity: str = ""
-    wandb_mode: str = "online"
+    run_name: str = "dummy"
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Constraint checkers
-# -----------------------------
+# -----------------------------------------------------------------------------
 def _compare(value: int, relation: str, target: int) -> bool:
     if relation == "at least":
         return value >= target
@@ -233,25 +247,20 @@ CHECKERS = {
 }
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Reward
-# -----------------------------
-def reward_fn(*, completions, instruction_id_list, kwargs, **_ignored) -> list[float]:
+# -----------------------------------------------------------------------------
+def compute_rewards(
+    completions: list[str],
+    instruction_id_list: list[list[str]],
+    kwargs_list: list[list[dict]],
+) -> list[float]:
     rewards = []
-    for i, completion in enumerate(completions):
-        # extract text from conversational format
-        if isinstance(completion, list):
-            text = completion[-1]["content"] if completion else ""
-        else:
-            text = str(completion)
+    for text, ids, kws in zip(completions, instruction_id_list, kwargs_list):
         text = text.strip()
-
         if not text:
             rewards.append(0.0)
             continue
-
-        ids = instruction_id_list[i]
-        kws = kwargs[i]
         if not ids:
             rewards.append(0.5)
             continue
@@ -260,27 +269,26 @@ def reward_fn(*, completions, instruction_id_list, kwargs, **_ignored) -> list[f
         for constraint_id, kw in zip(ids, kws):
             checker = CHECKERS.get(constraint_id)
             if checker is None:
-                passed += 1  # skip unknown constraints
+                passed += 1
                 continue
             if checker(text, kw):
                 passed += 1
-
         rewards.append(passed / len(ids))
     return rewards
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Dataset
-# -----------------------------
-def load_ifeval_dataset(cfg: TrainConfig, eval_size: int = 100) -> tuple[Dataset, Dataset]:
+# -----------------------------------------------------------------------------
+def load_ifeval_dataset(cfg: TrainConfig, eval_size: int = 100) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split="train")
-    
+
     rows = []
     for example in ds:
         rows.append({
-            "prompt": [{"role": "user", "content": example["prompt"]}],
-            "instruction_id_list": example["instruction_id_list"],
-            "kwargs": example["kwargs"],
+            "prompt": example["prompt"],
+            "instruction_id_list": json.dumps(example["instruction_id_list"]),
+            "kwargs": json.dumps(example["kwargs"]),
         })
 
     full = Dataset.from_list(rows)
@@ -290,138 +298,135 @@ def load_ifeval_dataset(cfg: TrainConfig, eval_size: int = 100) -> tuple[Dataset
     return full, None
 
 
-# -----------------------------
-# wandb helpers
-# -----------------------------
-def _is_main_process() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
+# -----------------------------------------------------------------------------
+# Generation (vLLM)
+# -----------------------------------------------------------------------------
+def generate_completions(
+    llm: LLM, tokenizer, prompts: list[str], *,
+    max_new_tokens: int, temperature: float, top_p: float,
+    num_generations: int,
+) -> tuple[list[list[int]], list[list[int]], list[str]]:
+    """
+    Generate completions using vLLM. Returns (all_input_ids, all_completion_masks, all_texts)
+    where each entry corresponds to one (prompt, generation) pair.
+    Each input_ids is the full sequence (prompt + completion).
+    Each completion_mask has 1 for completion tokens, 0 for prompt tokens.
+    all_texts contains the decoded completion strings.
+    """
+    sampling_params = SamplingParams(
+        n=num_generations,
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p,
+        max_tokens=max_new_tokens,
+    )
+
+    # Format prompts with chat template
+    formatted = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        formatted.append(tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        ))
+
+    outputs = llm.generate(formatted, sampling_params)
+
+    all_input_ids = []
+    all_completion_masks = []
+    all_texts = []
+    for output in outputs:
+        prompt_ids = list(output.prompt_token_ids)
+        prompt_len = len(prompt_ids)
+        for completion in output.outputs:
+            comp_ids = list(completion.token_ids)
+            seq_ids = prompt_ids + comp_ids
+            mask = [0] * prompt_len + [1] * len(comp_ids)
+            all_input_ids.append(seq_ids)
+            all_completion_masks.append(mask)
+            all_texts.append(completion.text)
+
+    return all_input_ids, all_completion_masks, all_texts
 
 
-def _wandb_enabled(report_to: str) -> bool:
-    targets = {target.strip().lower() for target in report_to.split(",")}
-    return "wandb" in targets
+# -----------------------------------------------------------------------------
+# Pad sequences to same length for batched forward pass
+# -----------------------------------------------------------------------------
+def pad_and_stack(
+    sequences: list[list[int]], masks: list[list[int]], pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad variable-length sequences. Returns (input_ids, attention_mask, completion_mask)."""
+    max_len = max(len(s) for s in sequences)
+    input_ids = []
+    attention_masks = []
+    completion_masks = []
+    for seq, mask in zip(sequences, masks):
+        pad_len = max_len - len(seq)
+        input_ids.append(seq + [pad_id] * pad_len)
+        attention_masks.append([1] * len(seq) + [0] * pad_len)
+        completion_masks.append(mask + [0] * pad_len)
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attention_masks, dtype=torch.long),
+        torch.tensor(completion_masks, dtype=torch.long),
+    )
 
 
-def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
-    if not _wandb_enabled(cfg.report_to) or not _is_main_process():
-        return
+# -----------------------------------------------------------------------------
+# GRPO loss computation
+# -----------------------------------------------------------------------------
+def compute_grpo_loss(
+    model, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    completion_mask: torch.Tensor, advantages: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Standard GRPO loss: on-policy REINFORCE with group-normalized rewards, token-level loss.
+    """
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    logits = logits[:, :-1, :]
+    targets = input_ids[:, 1:]
+    token_mask = completion_mask[:, 1:].float()
 
-    try:
-        import wandb
-    except ImportError as e:
-        raise ImportError(
-            "W&B logging is enabled but `wandb` is not installed. Install it with: uv add wandb"
-        ) from e
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
-    os.environ["WANDB_PROJECT"] = cfg.wandb_project
-    if cfg.wandb_entity:
-        os.environ["WANDB_ENTITY"] = cfg.wandb_entity
+    per_token_loss = advantages.unsqueeze(-1) * token_log_probs * token_mask
+    num_valid = token_mask.sum().clamp(min=1)
+    loss = -per_token_loss.sum() / num_valid
 
-    api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
-
-    # Never call wandb.login() without a key: relogin=True alone triggers interactive auth and
-    # raises UsageError in CI/containers. With a key, login explicitly; otherwise rely on
-    # stored credentials or offline mode.
-    wandb_mode = cfg.wandb_mode
-    if not api_key and str(wandb_mode).lower() == "online":
-        print(
-            "W&B: no API key (set WANDB_API_KEY); "
-            "using offline mode. Logs are written under wandb/ locally."
-        )
-        wandb_mode = "offline"
-
-    os.environ["WANDB_MODE"] = wandb_mode
-
-    if api_key:
-        wandb.login(key=api_key, relogin=True)
-
-    if wandb.run is None:
-        init_kwargs: dict[str, Any] = {
-            "project": cfg.wandb_project,
-            "name": run_name,
-            "mode": wandb_mode,
-            "config": asdict(cfg),
-        }
-        if cfg.wandb_entity:
-            init_kwargs["entity"] = cfg.wandb_entity
-        wandb.init(**init_kwargs)
+    stats = {
+        "grpo/mean_advantage": advantages.mean().item(),
+    }
+    return loss, stats
 
 
-def finish_wandb() -> None:
-    if not _is_main_process():
-        return
-    try:
-        import wandb
-    except ImportError:
-        return
-    if wandb.run is not None:
-        wandb.finish()
-
-
-class EvalLogCallback(TrainerCallback):
-    """Appends evaluation metrics to a markdown file after each eval run."""
-
-    def __init__(self, output_dir: str):
-        self.log_path = os.path.join(output_dir, "eval_results.md")
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if metrics is None or int(os.environ.get("RANK", "0")) != 0:
-            return
-        step = state.global_step
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        # write header on first eval
-        write_header = not os.path.exists(self.log_path)
-        with open(self.log_path, "a") as f:
-            if write_header:
-                f.write("# Evaluation Results\n\n")
-                f.write("| Step | Timestamp | " + " | ".join(sorted(metrics.keys())) + " |\n")
-                f.write("|------|-----------|" + "|".join("---" for _ in metrics) + "|\n")
-            values = " | ".join(
-                f"{metrics[k]:.4f}" if isinstance(metrics[k], float) else str(metrics[k])
-                for k in sorted(metrics.keys())
-            )
-            f.write(f"| {step} | {timestamp} | {values} |\n")
-
-
-def cleanup_compute() -> None:
-    gc.collect()
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Dry run
-# -----------------------------
+# -----------------------------------------------------------------------------
 def dry_run(cfg: TrainConfig):
     print("=" * 60)
-    print("IFEval GRPO DRY RUN")
+    print("IFEval GRPO (Native PyTorch) - DRY RUN")
     print("=" * 60)
 
     print(f"\n[Config]")
     print(f"  model:            {cfg.model_name}")
     print(f"  num_generations:  {cfg.num_generations}")
-    print(f"  batch_size:       {cfg.per_device_train_batch_size}")
-    print(f"  grad_accum:       {cfg.gradient_accumulation_steps}")
+    print(f"  batch_size:       {cfg.batch_size}")
+    print(f"  per_device_bs:    {cfg.per_device_batch_size}")
     print(f"  max_completion:   {cfg.max_completion_length}")
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
+    print(f"  vllm_gpu_util:    {cfg.vllm_gpu_memory_utilization}")
     print(f"  output_dir:       {cfg.output_dir}")
 
     print(f"\n[Dataset]")
     train_dataset, eval_dataset = load_ifeval_dataset(cfg, cfg.eval_size)
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
-    dataset = train_dataset
 
     # constraint coverage stats
     from collections import Counter
     all_ids = []
-    for ids in dataset["instruction_id_list"]:
-        all_ids.extend(ids)
+    for row in train_dataset:
+        all_ids.extend(json.loads(row["instruction_id_list"]))
     counts = Counter(all_ids)
     covered = sum(c for cid, c in counts.items() if cid in CHECKERS)
     total = sum(counts.values())
@@ -435,15 +440,15 @@ def dry_run(cfg: TrainConfig):
         print(f"    {tag} {cid}: {count}")
 
     print(f"\n[Reward function test]")
-    # test with a synthetic completion against the first example
-    first = dataset[0]
-    print(f"  Prompt: {first['prompt'][0]['content'][:100]}...")
-    print(f"  Constraints: {first['instruction_id_list']}")
-    test_completions = [[{"role": "assistant", "content": "This is a test response."}]]
-    test_rewards = reward_fn(
-        completions=test_completions,
-        instruction_id_list=[first["instruction_id_list"]],
-        kwargs=[first["kwargs"]],
+    first = train_dataset[0]
+    first_ids = json.loads(first["instruction_id_list"])
+    first_kwargs = json.loads(first["kwargs"])
+    print(f"  Prompt: {first['prompt'][:100]}...")
+    print(f"  Constraints: {first_ids}")
+    test_rewards = compute_rewards(
+        ["This is a test response."],
+        [first_ids],
+        [first_kwargs],
     )
     print(f"  Test reward: {test_rewards[0]:.2f}")
 
@@ -461,106 +466,240 @@ def dry_run(cfg: TrainConfig):
     print("=" * 60)
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Main
-# -----------------------------
+# -----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="IFEval GRPO training for instruction following")
-    parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
-    parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
-    parser.add_argument("--resume-from-checkpoint", type=str, default=None)
-    parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
-    parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps (default: 50)")
-    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples (default: 200)")
+    parser = argparse.ArgumentParser(description="IFEval GRPO training (native PyTorch)")
+    parser.add_argument("--config", type=str, default=None, help="YAML config override")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables)")
+    parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+    parser.add_argument("--num-generations", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig()
+    cfg.run_name = args.run
 
-    overrides = {}
+    # YAML overrides
     if args.config:
         with open(args.config) as f:
             overrides = yaml.safe_load(f) or {}
-    if args.run is not None:
-        overrides["report_to"] = "wandb"
-        if args.run:
-            overrides["wandb_project"] = args.run
-    if args.eval_steps is not None:
-        overrides["eval_steps"] = args.eval_steps
-    if args.eval_size is not None:
-        overrides["eval_size"] = args.eval_size
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, type(getattr(cfg, k))(v))
 
-    for k, v in overrides.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, type(getattr(cfg, k))(v))
+    # CLI overrides
+    if args.num_generations is not None:
+        cfg.num_generations = args.num_generations
+    if args.max_steps is not None:
+        cfg.max_steps = args.max_steps
+    if args.lr is not None:
+        cfg.learning_rate = args.lr
 
     if args.dry_run:
         dry_run(cfg)
         return
 
-    # load dataset
-    train_dataset, eval_dataset = load_ifeval_dataset(cfg, cfg.eval_size)
-    print(f"Train dataset: {len(train_dataset)} examples")
-    if eval_dataset:
-        print(f"Eval dataset: {len(eval_dataset)} examples (every {cfg.eval_steps} steps)")
+    # Init compute
+    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    master_process = ddp_rank == 0
 
-    # training config
-    model_short = cfg.model_name.split("/")[-1]
-    run_name = (
-        f"ifeval_{model_short}"
-        f"_g{cfg.num_generations}"
-        f"_bs{cfg.per_device_train_batch_size}"
-        f"_ga{cfg.gradient_accumulation_steps}"
-        f"_lr{cfg.learning_rate}"
+    torch.manual_seed(cfg.seed + ddp_rank)
+
+    # wandb
+    use_dummy = cfg.run_name == "dummy" or not master_process
+    wandb_run = DummyWandb() if use_dummy else wandb.init(
+        project="grpo-ifeval", name=cfg.run_name, config=asdict(cfg),
     )
 
-    training_args = GRPOConfig(
-        output_dir=cfg.output_dir,
-        run_name=run_name,
-        use_vllm=True,
-        vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-        vllm_tensor_parallel_size=cfg.vllm_tensor_parallel_size,
-        num_generations=cfg.num_generations,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        max_completion_length=cfg.max_completion_length,
-        learning_rate=cfg.learning_rate,
-        max_steps=cfg.max_steps,
-        epsilon=cfg.epsilon,
-        temperature=cfg.temperature,
-        warmup_steps=cfg.warmup_steps,
-        lr_scheduler_type=cfg.lr_scheduler_type,
-        weight_decay=cfg.weight_decay,
-        gradient_checkpointing=True,
-        loss_type="dapo",
-        mask_truncated_completions=True,
-        optim="adamw_torch_fused",
-        bf16=True,
-        logging_steps=cfg.logging_steps,
-        save_steps=cfg.save_steps,
-        eval_strategy="steps" if eval_dataset else "no",
-        eval_steps=cfg.eval_steps if eval_dataset else None,
-        report_to=cfg.report_to,
-        seed=cfg.seed,
-        log_completions=True,
-        model_init_kwargs={"torch_dtype": "auto"},
+    # Tokenizer
+    print0(f"Loading tokenizer from {cfg.model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Training model
+    print0(f"Loading training model: {cfg.model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
     )
+    model.config.use_cache = False
+    model.to(device)
 
-    setup_wandb(cfg, run_name)
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[ddp_local_rank],
+        )
+    raw_model = model.module if ddp else model
 
-    trainer = GRPOTrainer(
+    # vLLM inference engine (shares GPU with training model)
+    print0(f"Loading vLLM engine: {cfg.model_name}...")
+    llm = LLM(
         model=cfg.model_name,
-        reward_funcs=reward_fn,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
-        callbacks=[EvalLogCallback(cfg.output_dir)] if eval_dataset else None,
+        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+        dtype=cfg.vllm_dtype,
+        enable_prefix_caching=True,
     )
 
-    try:
-        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    finally:
-        finish_wandb()
-        cleanup_compute()
+    # Dataset
+    print0(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}...")
+    train_dataset, eval_dataset = load_ifeval_dataset(cfg, cfg.eval_size)
+    print0(f"Train: {len(train_dataset)} examples, Eval: {len(eval_dataset) if eval_dataset else 0}")
+
+    sampler = DistributedSampler(
+        train_dataset, num_replicas=ddp_world_size, rank=ddp_rank,
+        shuffle=True, drop_last=True,
+    ) if ddp else None
+
+    prompts_per_rank = cfg.batch_size // ddp_world_size
+    loader = DataLoader(
+        train_dataset, batch_size=prompts_per_rank, sampler=sampler,
+        shuffle=(sampler is None), drop_last=True,
+    )
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.learning_rate,
+        betas=(0.9, 0.95), weight_decay=cfg.weight_decay,
+        fused=(device_type == "cuda"),
+    )
+
+    def get_lr_lambda(step):
+        if step < cfg.warmup_steps:
+            return cfg.init_lr_frac + (1.0 - cfg.init_lr_frac) * step / max(cfg.warmup_steps, 1)
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
+
+    print0(f"Prompts per rank: {prompts_per_rank}, Generations per prompt: {cfg.num_generations}")
+    print0(f"Max steps: {cfg.max_steps}, Warmup: {cfg.warmup_steps}")
+
+    # Training loop
+    global_step = 0
+    data_iter = iter(loader)
+
+    while global_step < cfg.max_steps:
+        # Get next batch of prompts
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            if sampler is not None:
+                sampler.set_epoch(global_step)
+            data_iter = iter(loader)
+            batch = next(data_iter)
+
+        prompts = batch["prompt"]
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        # 1) Sync training weights into vLLM engine
+        llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
+            raw_model.named_parameters(),
+        )
+
+        # 2) Generate completions via vLLM
+        all_ids, all_masks, completions_text = generate_completions(
+            llm, tokenizer, prompts,
+            max_new_tokens=cfg.max_completion_length,
+            temperature=cfg.temperature, top_p=cfg.top_p,
+            num_generations=cfg.num_generations,
+        )
+
+        # 3) Expand per-prompt metadata to per-completion
+        ids_expanded = []
+        kwargs_expanded = []
+        for i in range(len(all_ids)):
+            prompt_idx = i // cfg.num_generations
+            ids_expanded.append(json.loads(batch["instruction_id_list"][prompt_idx]))
+            kwargs_expanded.append(json.loads(batch["kwargs"][prompt_idx]))
+
+        # 4) Compute rewards
+        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
+        rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
+
+        # 5) Group-normalize rewards to advantages (z-score per prompt group)
+        rewards_grouped = rewards_t.view(-1, cfg.num_generations)
+        mu = rewards_grouped.mean(dim=1, keepdim=True)
+        std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
+        advantages = ((rewards_grouped - mu) / std).view(-1)
+
+        # 6) Forward + GRPO loss in sub-batches
+        input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        completion_mask = completion_mask.to(device)
+
+        total_seqs = input_ids.shape[0]
+        num_sub_batches = math.ceil(total_seqs / cfg.per_device_batch_size)
+
+        optimizer.zero_grad(set_to_none=True)
+        total_loss = 0.0
+        all_stats = {"grpo/mean_reward": rewards_t.mean().item()}
+
+        model.train()
+        for sb in range(num_sub_batches):
+            b0 = sb * cfg.per_device_batch_size
+            b1 = min(b0 + cfg.per_device_batch_size, total_seqs)
+
+            loss, stats = compute_grpo_loss(
+                model, input_ids[b0:b1], attention_mask[b0:b1],
+                completion_mask[b0:b1], advantages[b0:b1],
+            )
+            loss = loss / num_sub_batches
+            loss.backward()
+            total_loss += loss.item()
+
+            for k, v in stats.items():
+                all_stats[k] = all_stats.get(k, 0.0) + v / num_sub_batches
+
+        # Gradient step
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        global_step += 1
+
+        # Logging
+        if global_step % cfg.log_every == 0:
+            loss_tensor = torch.tensor(total_loss, device=device)
+            if ddp:
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+
+            current_lr = scheduler.get_last_lr()[0]
+            stats_str = " ".join(f"{k}={v:.4f}" for k, v in all_stats.items())
+            print0(
+                f"step={global_step}/{cfg.max_steps} loss={loss_tensor.item():.4f} "
+                f"lr={current_lr:.2e} grad_norm={float(grad_norm):.4f} {stats_str}"
+            )
+            wandb_run.log({
+                "step": global_step,
+                "loss": loss_tensor.item(),
+                "lr": current_lr,
+                "grad_norm": float(grad_norm),
+                **all_stats,
+            })
+
+        # Save checkpoint
+        if master_process and global_step % cfg.save_every == 0:
+            ckpt_dir = os.path.join(cfg.output_dir, f"step_{global_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            raw_model.save_pretrained(ckpt_dir)
+            tokenizer.save_pretrained(ckpt_dir)
+            print0(f"Saved checkpoint to {ckpt_dir}")
+
+    # Final save
+    if master_process:
+        final_dir = os.path.join(cfg.output_dir, "final")
+        os.makedirs(final_dir, exist_ok=True)
+        raw_model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        print0(f"Saved final model to {final_dir}")
+
+    wandb_run.finish()
+    compute_cleanup()
+    print0("Training complete.")
 
 
 if __name__ == "__main__":
