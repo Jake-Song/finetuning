@@ -1,90 +1,111 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#      "torch==2.9.1",
-#     "trl[vllm]",
-#     "aiohttp",
-#     "omegaconf",
-#     "pyyaml",
+#     "torch==2.9.1",
+#     "transformers",
 #     "datasets",
-#     "accelerate",
-#     "huggingface-hub",
 #     "wandb",
-#     "python-dotenv>=1.2.2",
+#     "pyyaml",
 # ]
 # ///
 
+"""
+Multi-Domain On-Policy Distillation (MOPD) training in native PyTorch.
+
+Implements the MOPD algorithm from Nemotron-Cascade 2 (arXiv:2603.19220):
+  - Generate rollouts from inference policy (the current model)
+  - Compute token-level distillation advantage: a_t = log π_teacher(y_t|s_t) - log π_train(y_t|s_t)
+  - Truncated importance weighting for train/inference mismatch
+  - Surrogate loss: L = -1/|V(y)| * Σ w_t * sg(a_t) * log π_train(y_t|s_t)
+
+Also supports standard GRPO with outcome-based rewards when no teacher is used.
+
+Usage:
+  Single GPU:   uv run scripts/mopd_train.py --train-path data.jsonl
+  Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/mopd_train.py --train-path data.jsonl
+  Dry run:      uv run scripts/mopd_train.py --dry-run
+"""
+
 import argparse
-import gc
+import copy
 import json
+import math
 import os
 import re
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from collections import Counter
+from dataclasses import dataclass, asdict
 from typing import Any
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
+import wandb
 import yaml
 from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer, TrainerCallback
+from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from trl import GRPOConfig, GRPOTrainer
+from utils.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    DummyWandb,
+    autodetect_device_type,
+)
 
-from dotenv import load_dotenv
-load_dotenv()
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Config
-# -----------------------------
+# -----------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "MOPD"
     max_prompt_length: int = 2048
-    min_pass_rate: float = 0.0  # filter out samples below this pass_rate
-
-    # GRPO
-    num_generations: int = 4
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 16
     max_completion_length: int = 2048
-    learning_rate: float = 3e-6
-    epsilon: float = 0.2
-    temperature: float = 0.7
-    warmup_steps: int = 10
-    lr_scheduler_type: str = "linear"
+    min_pass_rate: float = 0.0
+
+    # MOPD-specific
+    use_mopd: bool = True
+    teacher_name: str = ""  # if empty, uses a frozen copy of the initial model
+    epsilon_low: float = 0.5   # importance weight clipping lower bound
+    epsilon_high: float = 2.0  # importance weight clipping upper bound
+
+    # GRPO fallback (used when use_mopd=False)
+    num_generations: int = 4
+    temperature: float = 1.0
+    top_p: float = 1.0
+
+    # Optimization
+    batch_size: int = 128        # total prompts per update (across all ranks)
+    per_device_batch_size: int = 4
+    learning_rate: float = 2e-6
+    warmup_steps: int = 30
+    init_lr_frac: float = 0.1    # initial LR = init_lr_frac * learning_rate
     weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
 
-    # vLLM (colocated mode)
-    vllm_gpu_memory_utilization: float = 0.3
-    vllm_tensor_parallel_size: int = 1
-
-    max_steps: int = 500
-    output_dir: str = "./ckpt_grpo_mopd"
-    save_steps: int = 50
-    logging_steps: int = 1
-    eval_steps: int = 200
+    max_steps: int = 50
+    output_dir: str = "./ckpt_mopd"
+    save_every: int = 25
+    log_every: int = 1
     eval_size: int = 100
     seed: int = 42
 
     # wandb
-    report_to: str = "none"
-    wandb_project: str = "grpo-mopd"
-    wandb_entity: str = ""
-    wandb_mode: str = "online"
+    run_name: str = "dummy"
 
 
-# -----------------------------
-# Reward
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Reward functions (for GRPO mode)
+# -----------------------------------------------------------------------------
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip()).lower()
 
 
 def _extract_with_regex(completion: str, output_regex: str) -> str | None:
-    """Extract answer from completion using the dataset's output_regex."""
     if not output_regex:
         return None
     try:
@@ -98,11 +119,9 @@ def _extract_with_regex(completion: str, output_regex: str) -> str | None:
 
 def _check_mcqa(completion: str, expected: str, output_regex: str) -> float:
     expected_norm = expected.strip().upper()
-    # use output_regex from template_metadata if available
     extracted = _extract_with_regex(completion, output_regex)
     if extracted and extracted.strip().upper() == expected_norm:
         return 1.0
-    # fallback: pattern matching
     patterns = [
         r"(?:answer|choice)\s*(?:is|:)\s*\(?([A-Z])\)?",
         r"\b([A-Z])\)",
@@ -165,7 +184,6 @@ def _check_tool_call(completion: str, ground_truth: list[dict]) -> float:
 
 
 def _check_structured_output(completion: str, expected: str, output_regex: str) -> float:
-    # try regex extraction first
     extracted = _extract_with_regex(completion, output_regex)
     if extracted and expected and _normalize(extracted) == _normalize(expected):
         return 1.0
@@ -182,8 +200,7 @@ def _check_structured_output(completion: str, expected: str, output_regex: str) 
         else:
             return 0.0
 
-    score = 0.5  # valid JSON
-
+    score = 0.5
     if expected:
         try:
             expected_parsed = json.loads(expected.strip())
@@ -194,7 +211,6 @@ def _check_structured_output(completion: str, expected: str, output_regex: str) 
         except (json.JSONDecodeError, ValueError):
             if _normalize(str(parsed)) == _normalize(expected):
                 score = 1.0
-
     return score
 
 
@@ -207,30 +223,18 @@ def _detect_category(category: str) -> str:
     return "mcqa"
 
 
-def reward_fn(
-    completions: list[str],
-    expected_answer: list[str],
-    category: list[str],
-    ground_truth: list,
-    output_regex: list[str],
-    **kwargs,
-) -> list[float]:
+def compute_rewards(completions: list[str], examples: list[dict]) -> list[float]:
     rewards = []
-    for i, completion in enumerate(completions):
-        if isinstance(completion, list):
-            text = completion[-1]["content"] if completion else ""
-        else:
-            text = str(completion)
+    for i, text in enumerate(completions):
         text = text.strip()
-
         if not text:
             rewards.append(0.0)
             continue
-
-        cat = _detect_category(category[i])
-        expected = expected_answer[i] or ""
-        gt = ground_truth[i] or []
-        regex = output_regex[i] or ""
+        ex = examples[i]
+        cat = _detect_category(ex.get("category", ""))
+        expected = ex.get("expected_answer", "") or ""
+        gt = ex.get("ground_truth") or []
+        regex = ex.get("output_regex", "") or ""
 
         if cat == "tool_call":
             rewards.append(_check_tool_call(text, gt))
@@ -238,38 +242,34 @@ def reward_fn(
             rewards.append(_check_structured_output(text, expected, regex))
         else:
             rewards.append(_check_mcqa(text, expected, regex))
-
     return rewards
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Dataset
-# -----------------------------
+# -----------------------------------------------------------------------------
 def load_mopd_dataset(
     name: str, config: str, max_prompt_length: int, tokenizer_name: str,
     min_pass_rate: float = 0.0, eval_size: int = 100,
-) -> tuple[Dataset, Dataset]:
+) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(name, config, split="train")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     rows = []
-    skipped_pass_rate = 0
+    skipped = 0
     for example in ds:
-        # filter by pass_rate quality signal
         pass_rate = example.get("pass_rate")
         if pass_rate is not None and pass_rate < min_pass_rate:
-            skipped_pass_rate += 1
+            skipped += 1
             continue
 
         prompt_text = example.get("prompt") or example.get("question") or ""
         if not prompt_text:
             continue
 
-        # truncate long prompts
         tokens = tokenizer.encode(prompt_text, truncation=True, max_length=max_prompt_length)
         prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
 
-        # extract output_regex from template_metadata
         tmeta = example.get("template_metadata")
         output_regex = ""
         if isinstance(tmeta, dict):
@@ -278,21 +278,18 @@ def load_mopd_dataset(
             output_regex = tmeta[0].get("output_regex", "") or ""
 
         rows.append({
-            "prompt": [{"role": "user", "content": prompt_text}],
+            "prompt": prompt_text,
             "expected_answer": example.get("expected_answer", "") or "",
             "category": example.get("category", "") or "",
             "ground_truth": example.get("ground_truth") or [],
             "output_regex": output_regex,
         })
 
-    if skipped_pass_rate:
-        print(f"  Filtered {skipped_pass_rate} samples below min_pass_rate={min_pass_rate}")
+    if skipped:
+        print0(f"  Filtered {skipped} samples below min_pass_rate={min_pass_rate}")
 
     if not rows:
-        raise ValueError(
-            f"No usable rows found in dataset {name}/{config}. "
-            "Expected at least a prompt or question field."
-        )
+        raise ValueError(f"No usable rows found in dataset {name}/{config}.")
 
     full = Dataset.from_list(rows)
     if eval_size > 0 and eval_size < len(full):
@@ -301,123 +298,227 @@ def load_mopd_dataset(
     return full, None
 
 
-# -----------------------------
-# wandb helpers
-# -----------------------------
-def _is_main_process() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
+# -----------------------------------------------------------------------------
+# Generation
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def generate_completions(
+    model, tokenizer, prompts: list[str], *,
+    max_new_tokens: int, temperature: float, top_p: float,
+    num_generations: int, device: torch.device, per_device_batch_size: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Generate completions for a list of prompts. Returns (all_input_ids, all_completion_masks)
+    where each entry corresponds to one (prompt, generation) pair.
+    Each input_ids is the full sequence (prompt + completion).
+    Each completion_mask has 1 for completion tokens, 0 for prompt tokens.
+    """
+    model.eval()
+    all_input_ids = []
+    all_completion_masks = []
 
-
-def _wandb_enabled(report_to: str) -> bool:
-    targets = {target.strip().lower() for target in report_to.split(",")}
-    return "wandb" in targets
-
-
-def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
-    if not _wandb_enabled(cfg.report_to) or not _is_main_process():
-        return
-
-    try:
-        import wandb
-    except ImportError as e:
-        raise ImportError(
-            "W&B logging is enabled but `wandb` is not installed. Install it with: uv add wandb"
-        ) from e
-
-    os.environ["WANDB_PROJECT"] = cfg.wandb_project
-    if cfg.wandb_entity:
-        os.environ["WANDB_ENTITY"] = cfg.wandb_entity
-
-    api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
-
-    wandb_mode = cfg.wandb_mode
-    if not api_key and str(wandb_mode).lower() == "online":
-        print(
-            "W&B: no API key (set WANDB_API_KEY); "
-            "using offline mode. Logs are written under wandb/ locally."
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
         )
-        wandb_mode = "offline"
+        prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True,
+                               max_length=max_new_tokens * 2)
+        prompt_ids = prompt_enc["input_ids"].to(device)
+        prompt_len = prompt_ids.shape[1]
 
-    os.environ["WANDB_MODE"] = wandb_mode
+        # Generate in sub-batches to avoid OOM
+        for gen_start in range(0, num_generations, per_device_batch_size):
+            gen_count = min(per_device_batch_size, num_generations - gen_start)
+            batch_prompt = prompt_ids.expand(gen_count, -1)
 
-    if api_key:
-        wandb.login(key=api_key, relogin=True)
-
-    if wandb.run is None:
-        init_kwargs: dict[str, Any] = {
-            "project": cfg.wandb_project,
-            "name": run_name,
-            "mode": wandb_mode,
-            "config": asdict(cfg),
-        }
-        if cfg.wandb_entity:
-            init_kwargs["entity"] = cfg.wandb_entity
-        wandb.init(**init_kwargs)
-
-
-def finish_wandb() -> None:
-    if not _is_main_process():
-        return
-    try:
-        import wandb
-    except ImportError:
-        return
-    if wandb.run is not None:
-        wandb.finish()
-
-
-class EvalLogCallback(TrainerCallback):
-    """Appends evaluation metrics to a markdown file after each eval run."""
-
-    def __init__(self, output_dir: str):
-        self.log_path = os.path.join(output_dir, "eval_results.md")
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if metrics is None or int(os.environ.get("RANK", "0")) != 0:
-            return
-        step = state.global_step
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        write_header = not os.path.exists(self.log_path)
-        with open(self.log_path, "a") as f:
-            if write_header:
-                f.write("# Evaluation Results\n\n")
-                f.write("| Step | Timestamp | " + " | ".join(sorted(metrics.keys())) + " |\n")
-                f.write("|------|-----------|" + "|".join("---" for _ in metrics) + "|\n")
-            values = " | ".join(
-                f"{metrics[k]:.4f}" if isinstance(metrics[k], float) else str(metrics[k])
-                for k in sorted(metrics.keys())
+            outputs = model.generate(
+                batch_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature if temperature > 0 else 1.0,
+                top_p=top_p,
+                do_sample=temperature > 0,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             )
-            f.write(f"| {step} | {timestamp} | {values} |\n")
+
+            for seq in outputs:
+                seq_ids = seq.tolist()
+                mask = [0] * prompt_len + [1] * (len(seq_ids) - prompt_len)
+                all_input_ids.append(seq_ids)
+                all_completion_masks.append(mask)
+
+    model.train()
+    return all_input_ids, all_completion_masks
 
 
-def cleanup_compute() -> None:
-    gc.collect()
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+# -----------------------------------------------------------------------------
+# MOPD loss computation
+# -----------------------------------------------------------------------------
+def compute_mopd_loss(
+    train_model, teacher_model, inf_model,
+    input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    completion_mask: torch.Tensor,
+    epsilon_low: float, epsilon_high: float,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute the MOPD surrogate loss (Eq. 4 from arXiv:2603.19220).
+
+    Args:
+        train_model: the model being trained (π_train)
+        teacher_model: frozen domain teacher (π_teacher)
+        inf_model: frozen inference policy that generated the rollouts (π_inf)
+        input_ids: (B, T) token ids
+        attention_mask: (B, T) attention mask
+        completion_mask: (B, T) 1 for completion tokens, 0 for prompt/pad
+        epsilon_low, epsilon_high: importance weight clipping bounds
+
+    Returns:
+        loss: scalar MOPD loss
+        stats: dict with diagnostic values
+    """
+    # Forward all three models
+    train_logits = train_model(
+        input_ids=input_ids, attention_mask=attention_mask,
+    ).logits  # (B, T, V)
+
+    with torch.no_grad():
+        teacher_logits = teacher_model(
+            input_ids=input_ids, attention_mask=attention_mask,
+        ).logits
+        inf_logits = inf_model(
+            input_ids=input_ids, attention_mask=attention_mask,
+        ).logits
+
+    # Shift: predict next token. Use positions [:-1] to predict tokens at [1:]
+    train_logits = train_logits[:, :-1, :]  # (B, T-1, V)
+    teacher_logits = teacher_logits[:, :-1, :]
+    inf_logits = inf_logits[:, :-1, :]
+    targets = input_ids[:, 1:]  # (B, T-1)
+    token_mask = completion_mask[:, 1:].float()  # (B, T-1), valid completion tokens
+
+    # Log probabilities of the actually sampled tokens under each policy
+    train_log_probs = F.log_softmax(train_logits, dim=-1)  # (B, T-1, V)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    inf_log_probs = F.log_softmax(inf_logits, dim=-1)
+
+    # Gather log probs for the sampled tokens
+    # targets: (B, T-1) -> (B, T-1, 1)
+    target_idx = targets.unsqueeze(-1)
+    train_lp = train_log_probs.gather(dim=-1, index=target_idx).squeeze(-1)  # (B, T-1)
+    teacher_lp = teacher_log_probs.gather(dim=-1, index=target_idx).squeeze(-1)
+    inf_lp = inf_log_probs.gather(dim=-1, index=target_idx).squeeze(-1)
+
+    # Token-level distillation advantage (Eq. 2):
+    # a_t = log π_teacher(y_t|s_t) - log π_train(y_t|s_t)
+    advantage = (teacher_lp - train_lp).detach()  # sg[a_t]
+
+    # Importance weight (Eq. 3):
+    # r_t = π_train(y_t|s_t) / π_inf(y_t|s_t)
+    # w_t = sg[r_t] * 1[ε_low <= r_t <= ε_high]
+    log_ratio = train_lp - inf_lp
+    ratio = log_ratio.detach().exp()
+    in_range = (ratio >= epsilon_low) & (ratio <= epsilon_high)
+    weights = ratio * in_range.float()  # sg[r_t] * indicator
+
+    # MOPD surrogate loss (Eq. 4):
+    # L = -1/|V(y)| * Σ w_t * sg(a_t) * log π_train(y_t|s_t)
+    per_token_loss = weights * advantage * train_lp  # (B, T-1)
+    per_token_loss = per_token_loss * token_mask
+
+    num_valid = token_mask.sum().clamp(min=1)
+    loss = -per_token_loss.sum() / num_valid
+
+    # Diagnostics
+    with torch.no_grad():
+        mean_advantage = (advantage * token_mask).sum() / num_valid
+        mean_ratio = (ratio * token_mask).sum() / num_valid
+        clip_frac = 1.0 - (in_range.float() * token_mask).sum() / num_valid
+
+    stats = {
+        "mopd/advantage": mean_advantage.item(),
+        "mopd/importance_ratio": mean_ratio.item(),
+        "mopd/clip_fraction": clip_frac.item(),
+    }
+    return loss, stats
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
+# GRPO loss computation (fallback when no teacher)
+# -----------------------------------------------------------------------------
+def compute_grpo_loss(
+    model, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    completion_mask: torch.Tensor, advantages: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Standard GRPO loss (Eq. 1 from arXiv:2603.19220):
+    On-policy REINFORCE with group-normalized rewards, token-level loss.
+    """
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    logits = logits[:, :-1, :]
+    targets = input_ids[:, 1:]
+    token_mask = completion_mask[:, 1:].float()
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+
+    # advantages is (B,), broadcast to (B, T-1)
+    # Token-level: same advantage for all tokens in a sequence (Eq. 1)
+    per_token_loss = advantages.unsqueeze(-1) * token_log_probs * token_mask
+
+    # Normalize by total valid tokens across the group
+    num_valid = token_mask.sum().clamp(min=1)
+    loss = -per_token_loss.sum() / num_valid
+
+    stats = {
+        "grpo/mean_advantage": advantages.mean().item(),
+    }
+    return loss, stats
+
+
+# -----------------------------------------------------------------------------
+# Pad sequences to same length for batched forward pass
+# -----------------------------------------------------------------------------
+def pad_and_stack(
+    sequences: list[list[int]], masks: list[list[int]], pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad variable-length sequences. Returns (input_ids, attention_mask, completion_mask)."""
+    max_len = max(len(s) for s in sequences)
+    input_ids = []
+    attention_masks = []
+    completion_masks = []
+    for seq, mask in zip(sequences, masks):
+        pad_len = max_len - len(seq)
+        input_ids.append(seq + [pad_id] * pad_len)
+        attention_masks.append([1] * len(seq) + [0] * pad_len)
+        completion_masks.append(mask + [0] * pad_len)
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attention_masks, dtype=torch.long),
+        torch.tensor(completion_masks, dtype=torch.long),
+    )
+
+
+# -----------------------------------------------------------------------------
 # Dry run
-# -----------------------------
+# -----------------------------------------------------------------------------
 def dry_run(cfg: TrainConfig):
     print("=" * 60)
-    print("MOPD GRPO DRY RUN")
+    print("MOPD NATIVE PYTORCH - DRY RUN")
     print("=" * 60)
 
     print(f"\n[Config]")
     print(f"  model:            {cfg.model_name}")
+    print(f"  mode:             {'MOPD' if cfg.use_mopd else 'GRPO'}")
+    if cfg.use_mopd:
+        print(f"  teacher:          {cfg.teacher_name or '(frozen copy of initial model)'}")
+        print(f"  epsilon:          [{cfg.epsilon_low}, {cfg.epsilon_high}]")
     print(f"  dataset:          {cfg.dataset_name} ({cfg.dataset_config})")
     print(f"  max_prompt_len:   {cfg.max_prompt_length}")
     print(f"  min_pass_rate:    {cfg.min_pass_rate}")
     print(f"  num_generations:  {cfg.num_generations}")
-    print(f"  batch_size:       {cfg.per_device_train_batch_size}")
-    print(f"  grad_accum:       {cfg.gradient_accumulation_steps}")
-    print(f"  max_completion:   {cfg.max_completion_length}")
+    print(f"  batch_size:       {cfg.batch_size}")
     print(f"  lr:               {cfg.learning_rate}")
+    print(f"  warmup_steps:     {cfg.warmup_steps}")
     print(f"  max_steps:        {cfg.max_steps}")
     print(f"  output_dir:       {cfg.output_dir}")
 
@@ -429,8 +530,6 @@ def dry_run(cfg: TrainConfig):
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
 
-    # category distribution
-    from collections import Counter
     cats = Counter()
     regex_count = 0
     for row in train_dataset:
@@ -443,24 +542,18 @@ def dry_run(cfg: TrainConfig):
     print(f"  Samples with output_regex: {regex_count}")
 
     first = train_dataset[0]
-    print(f"\n  First prompt preview: {first['prompt'][0]['content'][:150]}...")
+    print(f"\n  First prompt preview: {first['prompt'][:150]}...")
     print(f"  First expected_answer: {first['expected_answer'][:100]}")
     print(f"  First category: {first['category']}")
-    print(f"  First output_regex: {first['output_regex'][:100] if first['output_regex'] else '(none)'}")
 
     print(f"\n[Reward function test]")
     test_completions = ["", "Answer: B", '{"name": "search", "arguments": {"query": "test"}}']
-    test_expected = ["B", "B", ""]
-    test_cats = ["mcqa", "mcqa", "tool_call"]
-    test_gt: list = [[], [], [{"name": "search", "arguments": {"query": "test"}}]]
-    test_regex = ["", "", ""]
-    test_rewards = reward_fn(
-        completions=test_completions,
-        expected_answer=test_expected,
-        category=test_cats,
-        ground_truth=test_gt,
-        output_regex=test_regex,
-    )
+    test_examples = [
+        {"category": "mcqa", "expected_answer": "B", "ground_truth": [], "output_regex": ""},
+        {"category": "mcqa", "expected_answer": "B", "ground_truth": [], "output_regex": ""},
+        {"category": "tool_call", "expected_answer": "", "ground_truth": [{"name": "search", "arguments": {"query": "test"}}], "output_regex": ""},
+    ]
+    test_rewards = compute_rewards(test_completions, test_examples)
     labels = ["empty", "correct mcqa", "exact tool call"]
     for label, rew in zip(labels, test_rewards):
         print(f"  {rew:.2f} <- {label}")
@@ -479,109 +572,316 @@ def dry_run(cfg: TrainConfig):
     print("=" * 60)
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Main
-# -----------------------------
+# -----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="MOPD (Multi-Domain On-Policy Distillation) GRPO training")
-    parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
-    parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
-    parser.add_argument("--resume-from-checkpoint", type=str, default=None)
-    parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
-    parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps")
-    parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples")
+    parser = argparse.ArgumentParser(description="MOPD training in native PyTorch")
+    parser.add_argument("--config", type=str, default=None, help="YAML config override")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables)")
+    parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+    parser.add_argument("--teacher", type=str, default=None, help="Teacher model name/path")
+    parser.add_argument("--no-mopd", action="store_true", help="Use GRPO instead of MOPD")
+    parser.add_argument("--num-generations", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig()
+    cfg.run_name = args.run
 
-    overrides = {}
+    # YAML overrides
     if args.config:
         with open(args.config) as f:
             overrides = yaml.safe_load(f) or {}
-    if args.run is not None:
-        overrides["report_to"] = "wandb"
-        if args.run:
-            overrides["wandb_project"] = args.run
-    if args.eval_steps is not None:
-        overrides["eval_steps"] = args.eval_steps
-    if args.eval_size is not None:
-        overrides["eval_size"] = args.eval_size
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, type(getattr(cfg, k))(v))
 
-    for k, v in overrides.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, type(getattr(cfg, k))(v))
+    # CLI overrides
+    if args.teacher:
+        cfg.teacher_name = args.teacher
+    if args.no_mopd:
+        cfg.use_mopd = False
+    if args.num_generations is not None:
+        cfg.num_generations = args.num_generations
+    if args.max_steps is not None:
+        cfg.max_steps = args.max_steps
+    if args.lr is not None:
+        cfg.learning_rate = args.lr
 
     if args.dry_run:
         dry_run(cfg)
         return
 
-    # load dataset
+    # Init compute
+    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    master_process = ddp_rank == 0
+
+    torch.manual_seed(cfg.seed + ddp_rank)
+
+    # wandb
+    use_dummy = cfg.run_name == "dummy" or not master_process
+    wandb_run = DummyWandb() if use_dummy else wandb.init(
+        project="mopd", name=cfg.run_name, config=asdict(cfg),
+    )
+
+    # Tokenizer
+    print0(f"Loading tokenizer from {cfg.model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Train model (π_train)
+    print0(f"Loading train model: {cfg.model_name}...")
+    train_model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    )
+    train_model.config.use_cache = False
+    train_model.to(device)
+
+    if ddp:
+        train_model = torch.nn.parallel.DistributedDataParallel(
+            train_model, device_ids=[ddp_local_rank],
+        )
+    raw_train_model = train_model.module if ddp else train_model
+
+    if cfg.use_mopd:
+        # Teacher model (π_teacher) — frozen
+        if cfg.teacher_name:
+            print0(f"Loading teacher model: {cfg.teacher_name}...")
+            teacher_model = AutoModelForCausalLM.from_pretrained(
+                cfg.teacher_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+            )
+        else:
+            print0("Using frozen copy of initial model as teacher...")
+            teacher_model = copy.deepcopy(raw_train_model)
+        teacher_model.to(device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+
+        # Inference model (π_inf) — frozen snapshot, updated each step
+        # In fully on-policy mode, π_inf = π_train at the start of each step.
+        # We keep a separate frozen copy to compute importance weights.
+        print0("Creating inference model snapshot...")
+        inf_model = copy.deepcopy(raw_train_model)
+        inf_model.to(device)
+        inf_model.eval()
+        for p in inf_model.parameters():
+            p.requires_grad = False
+
+    # Dataset
+    print0(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}...")
     train_dataset, eval_dataset = load_mopd_dataset(
         cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name,
         cfg.min_pass_rate, cfg.eval_size,
     )
-    print(f"Train dataset: {len(train_dataset)} examples")
-    if eval_dataset:
-        print(f"Eval dataset: {len(eval_dataset)} examples (every {cfg.eval_steps} steps)")
+    print0(f"Train: {len(train_dataset)} examples, Eval: {len(eval_dataset) if eval_dataset else 0}")
 
-    # training config
-    model_short = cfg.model_name.split("/")[-1]
-    run_name = (
-        f"mopd_{model_short}"
-        f"_g{cfg.num_generations}"
-        f"_bs{cfg.per_device_train_batch_size}"
-        f"_ga{cfg.gradient_accumulation_steps}"
-        f"_lr{cfg.learning_rate}"
+    sampler = DistributedSampler(
+        train_dataset, num_replicas=ddp_world_size, rank=ddp_rank,
+        shuffle=True, drop_last=True,
+    ) if ddp else None
+
+    # We load prompts in batches, then generate completions
+    prompts_per_rank = cfg.batch_size // ddp_world_size
+    loader = DataLoader(
+        train_dataset, batch_size=prompts_per_rank, sampler=sampler,
+        shuffle=(sampler is None), drop_last=True,
     )
 
-    training_args = GRPOConfig(
-        output_dir=cfg.output_dir,
-        run_name=run_name,
-        use_vllm=True,
-        vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-        vllm_tensor_parallel_size=cfg.vllm_tensor_parallel_size,
-        num_generations=cfg.num_generations,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        max_completion_length=cfg.max_completion_length,
-        learning_rate=cfg.learning_rate,
-        max_steps=cfg.max_steps,
-        epsilon=cfg.epsilon,
-        temperature=cfg.temperature,
-        warmup_steps=cfg.warmup_steps,
-        lr_scheduler_type=cfg.lr_scheduler_type,
-        weight_decay=cfg.weight_decay,
-        gradient_checkpointing=True,
-        loss_type="grpo",
-        mask_truncated_completions=True,
-        optim="adamw_torch_fused",
-        bf16=True,
-        logging_steps=cfg.logging_steps,
-        save_steps=cfg.save_steps,
-        eval_strategy="steps" if eval_dataset else "no",
-        eval_steps=cfg.eval_steps if eval_dataset else None,
-        report_to=cfg.report_to,
-        seed=cfg.seed,
-        log_completions=True,
-        model_init_kwargs={"torch_dtype": "auto"},
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        train_model.parameters(), lr=cfg.learning_rate,
+        betas=(0.9, 0.95), weight_decay=cfg.weight_decay,
+        fused=(device_type == "cuda"),
     )
 
-    setup_wandb(cfg, run_name)
+    # LR schedule: linear warmup from init_lr_frac * lr to lr, then constant
+    def get_lr_lambda(step):
+        if step < cfg.warmup_steps:
+            return cfg.init_lr_frac + (1.0 - cfg.init_lr_frac) * step / max(cfg.warmup_steps, 1)
+        return 1.0
 
-    trainer = GRPOTrainer(
-        model=cfg.model_name,
-        reward_funcs=reward_fn,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
-        callbacks=[EvalLogCallback(cfg.output_dir)] if eval_dataset else None,
-    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
 
-    try:
-        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    finally:
-        finish_wandb()
-        cleanup_compute()
+    print0(f"Mode: {'MOPD' if cfg.use_mopd else 'GRPO'}")
+    print0(f"Prompts per rank: {prompts_per_rank}, Generations per prompt: {cfg.num_generations}")
+    print0(f"Max steps: {cfg.max_steps}, Warmup: {cfg.warmup_steps}")
+
+    # Training loop
+    global_step = 0
+    data_iter = iter(loader)
+
+    while global_step < cfg.max_steps:
+        # Get next batch of prompts
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            if sampler is not None:
+                sampler.set_epoch(global_step)
+            data_iter = iter(loader)
+            batch = next(data_iter)
+
+        prompts = batch["prompt"]
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        if cfg.use_mopd:
+            # --- MOPD mode ---
+            # 1) Sync inference model to current train model weights (on-policy)
+            inf_model.load_state_dict(raw_train_model.state_dict())
+
+            # 2) Generate rollouts from π_inf
+            all_ids, all_masks = generate_completions(
+                inf_model, tokenizer, prompts,
+                max_new_tokens=cfg.max_completion_length,
+                temperature=cfg.temperature, top_p=cfg.top_p,
+                num_generations=cfg.num_generations,
+                device=device, per_device_batch_size=cfg.per_device_batch_size,
+            )
+
+            # 3) Forward pass + MOPD loss in sub-batches
+            input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            completion_mask = completion_mask.to(device)
+
+            total_seqs = input_ids.shape[0]
+            num_sub_batches = math.ceil(total_seqs / cfg.per_device_batch_size)
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            all_stats = {}
+
+            train_model.train()
+            for sb in range(num_sub_batches):
+                b0 = sb * cfg.per_device_batch_size
+                b1 = min(b0 + cfg.per_device_batch_size, total_seqs)
+
+                loss, stats = compute_mopd_loss(
+                    train_model, teacher_model, inf_model,
+                    input_ids[b0:b1], attention_mask[b0:b1], completion_mask[b0:b1],
+                    cfg.epsilon_low, cfg.epsilon_high,
+                )
+                loss = loss / num_sub_batches
+                loss.backward()
+                total_loss += loss.item()
+
+                for k, v in stats.items():
+                    all_stats[k] = all_stats.get(k, 0.0) + v / num_sub_batches
+
+        else:
+            # --- GRPO mode ---
+            # 1) Generate rollouts from current policy
+            all_ids, all_masks = generate_completions(
+                raw_train_model, tokenizer, prompts,
+                max_new_tokens=cfg.max_completion_length,
+                temperature=cfg.temperature, top_p=cfg.top_p,
+                num_generations=cfg.num_generations,
+                device=device, per_device_batch_size=cfg.per_device_batch_size,
+            )
+
+            # 2) Compute rewards
+            completions_text = []
+            examples_for_reward = []
+            for i, (seq, mask) in enumerate(zip(all_ids, all_masks)):
+                prompt_idx = i // cfg.num_generations
+                comp_start = sum(1 for m in mask if m == 0)
+                comp_tokens = seq[comp_start:]
+                completions_text.append(tokenizer.decode(comp_tokens, skip_special_tokens=True))
+                examples_for_reward.append({
+                    "category": batch["category"][prompt_idx],
+                    "expected_answer": batch["expected_answer"][prompt_idx],
+                    "ground_truth": batch["ground_truth"][prompt_idx],
+                    "output_regex": batch["output_regex"][prompt_idx],
+                })
+
+            rewards = compute_rewards(completions_text, examples_for_reward)
+            rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
+
+            # 3) Group-normalize rewards (z-score per prompt group, Eq. 1)
+            rewards_grouped = rewards_t.view(-1, cfg.num_generations)
+            mu = rewards_grouped.mean(dim=1, keepdim=True)
+            std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
+            advantages = ((rewards_grouped - mu) / std).view(-1)
+
+            # 4) Forward + GRPO loss in sub-batches
+            input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            completion_mask = completion_mask.to(device)
+
+            total_seqs = input_ids.shape[0]
+            num_sub_batches = math.ceil(total_seqs / cfg.per_device_batch_size)
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            all_stats = {"grpo/mean_reward": rewards_t.mean().item()}
+
+            train_model.train()
+            for sb in range(num_sub_batches):
+                b0 = sb * cfg.per_device_batch_size
+                b1 = min(b0 + cfg.per_device_batch_size, total_seqs)
+
+                loss, stats = compute_grpo_loss(
+                    train_model, input_ids[b0:b1], attention_mask[b0:b1],
+                    completion_mask[b0:b1], advantages[b0:b1],
+                )
+                loss = loss / num_sub_batches
+                loss.backward()
+                total_loss += loss.item()
+
+                for k, v in stats.items():
+                    all_stats[k] = all_stats.get(k, 0.0) + v / num_sub_batches
+
+        # Gradient step
+        grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        global_step += 1
+
+        # Logging
+        if global_step % cfg.log_every == 0:
+            loss_tensor = torch.tensor(total_loss, device=device)
+            if ddp:
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+
+            current_lr = scheduler.get_last_lr()[0]
+            stats_str = " ".join(f"{k}={v:.4f}" for k, v in all_stats.items())
+            print0(
+                f"step={global_step}/{cfg.max_steps} loss={loss_tensor.item():.4f} "
+                f"lr={current_lr:.2e} grad_norm={float(grad_norm):.4f} {stats_str}"
+            )
+            wandb_run.log({
+                "step": global_step,
+                "loss": loss_tensor.item(),
+                "lr": current_lr,
+                "grad_norm": float(grad_norm),
+                **all_stats,
+            })
+
+        # Save checkpoint
+        if master_process and global_step % cfg.save_every == 0:
+            ckpt_dir = os.path.join(cfg.output_dir, f"step_{global_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            raw_train_model.save_pretrained(ckpt_dir)
+            tokenizer.save_pretrained(ckpt_dir)
+            print0(f"Saved checkpoint to {ckpt_dir}")
+
+    # Final save
+    if master_process:
+        final_dir = os.path.join(cfg.output_dir, "final")
+        os.makedirs(final_dir, exist_ok=True)
+        raw_train_model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        print0(f"Saved final model to {final_dir}")
+
+    wandb_run.finish()
+    compute_cleanup()
+    print0("Training complete.")
 
 
 if __name__ == "__main__":
