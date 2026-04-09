@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import os
+from functools import partial
+
 import torch
+
+
+def _apply_loaded_weights(vllm_model, named_weights):
+    loaded = vllm_model.load_weights(named_weights)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return 0 if loaded is None else len(loaded)
 
 
 def sync_vllm_model_weights(llm, model) -> None:
@@ -12,12 +22,6 @@ def sync_vllm_model_weights(llm, model) -> None:
     `llm_engine.model_executor.driver_worker` are no longer exposed.
     """
 
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     weights = [(name, param.detach().cpu()) for name, param in model.named_parameters()]
-
-    def _load_weights(vllm_model, named_weights):
-        loaded = vllm_model.load_weights(named_weights)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return 0 if loaded is None else len(loaded)
-
-    llm.apply_model(lambda vllm_model: _load_weights(vllm_model, weights))
+    llm.apply_model(partial(_apply_loaded_weights, named_weights=weights))

@@ -29,6 +29,8 @@ import os
 import re
 from dataclasses import asdict, dataclass
 
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F

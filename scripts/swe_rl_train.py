@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
