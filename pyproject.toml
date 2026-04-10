@@ -8,10 +8,10 @@ dependencies = [
     "torch==2.10.0",
     "transformers==4.56.0",
     "datasets==4.8.4",
-    "pyyaml",
+    "pyyaml==6.0.3",
     "vllm==0.19.0; sys_platform != 'win32'",
-    "openai",
-    "wandb",
+    "openai==2.31.0",
+    "wandb==0.25.1",
     "python-dotenv==1.2.2",
     "huggingface_hub>=0.34.0,<1.0"
 ]
