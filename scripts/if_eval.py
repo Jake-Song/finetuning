@@ -5,6 +5,7 @@ import time
 from collections import Counter
 
 import torch
+import yaml
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -19,8 +20,9 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 
 
 def load_eval_examples(dataset_name: str | None = None, dataset_config: str | None = None) -> list[dict]:
-    name = dataset_name or TrainConfig.dataset_name
-    config = dataset_config or TrainConfig.dataset_config
+    cfg = TrainConfig()
+    name = dataset_name or cfg.dataset_name
+    config = dataset_config or cfg.dataset_config
     ds = load_dataset(name, config, split="train")
     return list(ds)
 
@@ -55,30 +57,51 @@ def evaluate_constraints(text: str, instruction_ids: list[str], kwargs_list: lis
     return results
 
 
+def build_config(config_path: str | None) -> TrainConfig:
+    cfg = TrainConfig()
+    if not config_path:
+        return cfg
+
+    with open(config_path, encoding="utf-8") as f:
+        overrides = yaml.safe_load(f) or {}
+
+    for key, value in overrides.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, type(getattr(cfg, key))(value))
+    return cfg
+
+
 def main():
+    default_cfg = TrainConfig()
     parser = argparse.ArgumentParser(
         description="Evaluate a trained model on instruction-following constraints (Nemotron IF-RL by default)"
     )
+    parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
     parser.add_argument(
         "--dataset-name",
         type=str,
         default=None,
-        help=f"HF dataset id (default: {TrainConfig.dataset_name})",
+        help=f"HF dataset id (default: {default_cfg.dataset_name})",
     )
     parser.add_argument(
         "--dataset-config",
         type=str,
         default=None,
-        help=f"HF dataset config name (default: {TrainConfig.dataset_config})",
+        help=f"HF dataset config name (default: {default_cfg.dataset_config})",
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help=f"Model checkpoint path (default: base model {TrainConfig.model_name})",
+        help=f"Model checkpoint path (default: base model {default_cfg.model_name})",
     )
     parser.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path (defaults to checkpoint)")
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help=f"Max generated tokens (default: {default_cfg.max_completion_length})",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples to evaluate")
     parser.add_argument("--num-samples", type=int, default=1, help="Number of samples per example for pass@k")
@@ -87,10 +110,12 @@ def main():
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     args = parser.parse_args()
+    cfg = build_config(args.config)
 
     k_values = [int(k) for k in args.pass_k.split(",")]
     num_samples = args.num_samples
     temperature = args.temperature
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else cfg.max_completion_length
 
     # force sampling when generating multiple samples
     if num_samples > 1 and temperature == 0.0:
@@ -109,7 +134,7 @@ def main():
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     # load model
-    model_path = args.checkpoint or TrainConfig.model_name
+    model_path = args.checkpoint or cfg.model_name
     print(f"Loading model from {model_path} (device={device}, dtype={dtype})")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or model_path)
     if tokenizer.pad_token is None:
@@ -119,10 +144,10 @@ def main():
     model.eval()
 
     # load dataset
-    ds_name = args.dataset_name or TrainConfig.dataset_name
-    ds_config = args.dataset_config or TrainConfig.dataset_config
+    ds_name = args.dataset_name or cfg.dataset_name
+    ds_config = args.dataset_config or cfg.dataset_config
     print(f"Loading eval data: {ds_name} ({ds_config})")
-    examples = load_eval_examples(args.dataset_name, args.dataset_config)
+    examples = load_eval_examples(ds_name, ds_config)
     if args.max_examples:
         examples = examples[:args.max_examples]
     print(f"Evaluating on {len(examples)} examples, {num_samples} sample(s) each")
@@ -146,7 +171,7 @@ def main():
         samples = []
         n_correct = 0
         for s in range(num_samples):
-            completion = generate(model, tokenizer, prompt, args.max_new_tokens, temperature, device)
+            completion = generate(model, tokenizer, prompt, max_new_tokens, temperature, device)
             constraint_results = evaluate_constraints(completion, instruction_ids, kwargs_list)
             known_results = {k: v for k, v in constraint_results.items() if v is not None}
             n_passed = sum(known_results.values())

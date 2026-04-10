@@ -5,10 +5,11 @@ import time
 from collections import Counter
 
 import torch
+import yaml
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from swe_rl_train import _extract_changed_lines
+from swe_rl_train import TrainConfig, _extract_changed_lines
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -48,6 +49,20 @@ def load_swe_rl_examples(name: str, config: str) -> list[dict]:
             "Expected prompt+patch fields like (prompt, golden_patch) or (problem_statement, patch)."
         )
     return rows
+
+
+def build_config(config_path: str | None) -> TrainConfig:
+    cfg = TrainConfig()
+    if not config_path:
+        return cfg
+
+    with open(config_path, encoding="utf-8") as f:
+        overrides = yaml.safe_load(f) or {}
+
+    for key, value in overrides.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, type(getattr(cfg, key))(value))
+    return cfg
 
 
 @torch.inference_mode()
@@ -125,12 +140,34 @@ def score_patch(generated: str, golden: str) -> dict:
 
 
 def main():
+    default_cfg = TrainConfig()
     parser = argparse.ArgumentParser(description="Evaluate a trained model on SWE-RL patch generation")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
+    parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=f"Model checkpoint path (default: base model {default_cfg.model_name})",
+    )
     parser.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path (defaults to checkpoint)")
-    parser.add_argument("--dataset-name", type=str, default="nvidia/Nemotron-Cascade-2-RL-data")
-    parser.add_argument("--dataset-config", type=str, default="SWE-RL")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help=f"HF dataset id (default: {default_cfg.dataset_name})",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=None,
+        help=f"HF dataset config name (default: {default_cfg.dataset_config})",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help=f"Max generated tokens (default: {default_cfg.max_completion_length})",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples to evaluate")
     parser.add_argument("--num-samples", type=int, default=1, help="Number of samples per example for pass@k")
@@ -139,10 +176,12 @@ def main():
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     args = parser.parse_args()
+    cfg = build_config(args.config)
 
     k_values = [int(k) for k in args.pass_k.split(",")]
     num_samples = args.num_samples
     temperature = args.temperature
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else cfg.max_completion_length
 
     # force sampling when generating multiple samples
     if num_samples > 1 and temperature == 0.0:
@@ -161,16 +200,20 @@ def main():
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     # load model
-    print(f"Loading model from {args.checkpoint} (device={device}, dtype={dtype})")
-    tokenizer = load_tokenizer_with_safe_mistral_fix(args.tokenizer or args.checkpoint)
+    model_path = args.checkpoint or cfg.model_name
+    print(f"Loading model from {model_path} (device={device}, dtype={dtype})")
+    tokenizer = load_tokenizer_with_safe_mistral_fix(args.tokenizer or model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.checkpoint, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
     model.to(device)
     model.eval()
 
     # load dataset
-    examples = load_swe_rl_examples(args.dataset_name, args.dataset_config)
+    ds_name = args.dataset_name or cfg.dataset_name
+    ds_config = args.dataset_config or cfg.dataset_config
+    print(f"Loading eval data: {ds_name} ({ds_config})")
+    examples = load_swe_rl_examples(ds_name, ds_config)
     if args.max_examples:
         examples = examples[:args.max_examples]
     print(f"Evaluating on {len(examples)} examples, {num_samples} sample(s) each")
@@ -196,7 +239,7 @@ def main():
         best_scores = None
 
         for s in range(num_samples):
-            completion = generate(model, tokenizer, prompt, args.max_new_tokens, temperature, device)
+            completion = generate(model, tokenizer, prompt, max_new_tokens, temperature, device)
             scores = score_patch(completion, golden_patch)
 
             if scores["exact_match"] == 1.0:
@@ -264,7 +307,7 @@ def main():
     # final report
     elapsed = time.time() - started
     print(f"\n{'='*60}")
-    print(f"SWE-RL Results: {args.checkpoint}")
+    print(f"SWE-RL Results ({ds_name}/{ds_config}): {model_path}")
     print(f"{'='*60}")
     print(f"  Examples:       {total_examples}")
     print(f"  Samples/example: {num_samples}")
