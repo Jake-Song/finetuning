@@ -21,9 +21,10 @@ Implements the MOPD algorithm from Nemotron-Cascade 2 (arXiv:2603.19220):
 Also supports standard GRPO with outcome-based rewards when no teacher is used.
 
 Usage:
-  Single GPU:   uv run scripts/mopd_train.py --train-path data.jsonl
-  Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/mopd_train.py --train-path data.jsonl
+  Single GPU:   uv run scripts/mopd_train.py
+  Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/mopd_train.py
   Dry run:      uv run scripts/mopd_train.py --dry-run
+  Paper preset: uv run scripts/mopd_train.py --config configs/mopd/nemotron_cascade2_paper.yaml
 """
 
 import argparse
@@ -577,7 +578,12 @@ def dry_run(cfg: TrainConfig):
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="MOPD training in native PyTorch")
-    parser.add_argument("--config", type=str, default=None, help="YAML config override")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML config override, e.g. configs/mopd/nemotron_cascade2_paper.yaml",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables)")
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
