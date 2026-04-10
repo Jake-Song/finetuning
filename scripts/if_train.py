@@ -57,11 +57,11 @@ class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "IF-RL"
-    max_prompt_length: int = 256
+    max_prompt_length: int = 512
 
     # GRPO
     num_generations: int = 4
-    max_completion_length: int = 256
+    max_completion_length: int = 512
     temperature: float = 0.7
     top_p: float = 1.0
 
@@ -76,7 +76,7 @@ class TrainConfig:
     vllm_max_parallel_requests: int = 8
 
     # Optimization
-    batch_size: int = 16
+    batch_size: int = 128
     per_device_batch_size: int = 8
     learning_rate: float = 1e-6
     warmup_steps: int = 10
@@ -84,7 +84,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
 
-    max_steps: int = 500
+    max_steps: int = 100
     output_dir: str = "./ckpt_grpo_ifeval"
     save_every: int = 50
     log_every: int = 1
