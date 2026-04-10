@@ -1,0 +1,3 @@
+dataset_config: "SWE-RL"
+num_generations: 64
+learning_rate: 3e-6

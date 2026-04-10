@@ -1,0 +1,6 @@
+dataset_config: "IF-RL"
+num_generations: 16
+batch_size: 128
+max_completion_length: 49152
+learning_rate: 3e-6
+max_steps: 180

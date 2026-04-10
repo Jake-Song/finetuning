@@ -12,6 +12,16 @@
 # ]
 # ///
 
+"""
+Multi-Domain RL training in native PyTorch.
+
+Usage:
+  Single GPU:   uv run scripts/multi_domain_rl_train.py
+  Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/multi_domain_rl_train.py
+  Dry run:      uv run scripts/multi_domain_rl_train.py --dry-run
+  Paper preset: uv run scripts/multi_domain_rl_train.py --config configs/multi_domain_rl/nemotron_cascade2_paper.yaml
+"""
+
 import argparse
 import gc
 import json
@@ -630,7 +640,12 @@ def dry_run(cfg: TrainConfig):
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Domain RL training (native PyTorch)")
-    parser.add_argument("--config", type=str, default=None, help="Optional YAML config override")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML config override, e.g. configs/multi_domain_rl/nemotron_cascade2_paper.yaml",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")

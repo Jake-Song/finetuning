@@ -1,0 +1,5 @@
+dataset_config: "multi-domain-RL"
+num_generations: 16
+learning_rate: 3e-6
+max_completion_length: 49152
+max_steps: 70

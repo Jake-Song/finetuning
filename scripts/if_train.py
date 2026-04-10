@@ -21,6 +21,7 @@ Usage:
   Single GPU:   uv run scripts/if_train.py
   Multi-GPU:    uv run torchrun --nproc_per_node=N scripts/if_train.py
   Dry run:      uv run scripts/if_train.py --dry-run
+  Paper preset: uv run scripts/if_train.py --config configs/if_rl/nemotron_cascade2_paper.yaml
 """
 
 import argparse
@@ -448,7 +449,12 @@ def dry_run(cfg: TrainConfig):
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="IFEval GRPO training (native PyTorch)")
-    parser.add_argument("--config", type=str, default=None, help="YAML config override")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML config override, e.g. configs/if_rl/nemotron_cascade2_paper.yaml",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables)")
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
