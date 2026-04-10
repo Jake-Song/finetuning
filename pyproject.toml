@@ -3,17 +3,17 @@ name = "finetuning"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "torch==2.10.0",
-    "transformers>=5.5.2",
-    "datasets>=4.8.4",
+    "transformers==4.56.0",
+    "datasets==4.8.4",
     "pyyaml",
-    "vllm>=0.19.0",
+    "vllm==0.19.0; sys_platform != 'win32'",
     "openai",
     "wandb",
-    "python-dotenv>=1.2.2",
-    "huggingface_hub>=1.10.1"
+    "python-dotenv==1.2.2",
+    "huggingface_hub>=0.34.0,<1.0"
 ]
 
 [build-system]
