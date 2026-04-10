@@ -111,4 +111,5 @@ Use `--vllm-model-name` if the server model name differs from the trainer model 
 
 - The server is used for rollout generation through the OpenAI-compatible Chat Completions API.
 - Weight sync is done separately through vLLM’s training/weight-transfer path.
+- NCCL weight sync in this repo supports multi-GPU trainers only when the vLLM server uses a single GPU worker.
 - If training stalls, check that the server is reachable and that the weight-sync backend matches the server startup mode.

@@ -606,6 +606,8 @@ def main():
             backend=cfg.vllm_weight_sync_backend,
             timeout=cfg.vllm_sync_timeout,
             is_sync_leader=master_process,
+            trainer_rank=ddp_rank,
+            trainer_world_size=ddp_world_size,
         )
         if ddp:
             dist.barrier()
