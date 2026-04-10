@@ -460,7 +460,9 @@ def compute_grpo_loss(
     token_mask = completion_mask[:, 1:].float()
 
     log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
     token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    token_entropy = -(probs * log_probs).sum(dim=-1)
 
     # advantages is (B,), broadcast to (B, T-1)
     # Token-level: same advantage for all tokens in a sequence (Eq. 1)
@@ -469,9 +471,11 @@ def compute_grpo_loss(
     # Normalize by total valid tokens across the group
     num_valid = token_mask.sum().clamp(min=1)
     loss = -per_token_loss.sum() / num_valid
+    mean_entropy = (token_entropy * token_mask).sum() / num_valid
 
     stats = {
         "grpo/mean_advantage": advantages.mean().item(),
+        "grpo/entropy": mean_entropy.item(),
     }
     return loss, stats
 
@@ -825,7 +829,10 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             total_loss = 0.0
-            all_stats = {"grpo/mean_reward": rewards_t.mean().item()}
+            all_stats = {
+                "grpo/mean_reward": rewards_t.mean().item(),
+                "grpo/group_reward_std": rewards_grouped.std(dim=1).mean().item(),
+            }
 
             train_model.train()
             for sb in range(num_sub_batches):

@@ -363,14 +363,18 @@ def compute_grpo_loss(
     token_mask = completion_mask[:, 1:].float()
 
     log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
     token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    token_entropy = -(probs * log_probs).sum(dim=-1)
 
     per_token_loss = advantages.unsqueeze(-1) * token_log_probs * token_mask
     num_valid = token_mask.sum().clamp(min=1)
     loss = -per_token_loss.sum() / num_valid
+    mean_entropy = (token_entropy * token_mask).sum() / num_valid
 
     stats = {
         "grpo/mean_advantage": advantages.mean().item(),
+        "grpo/entropy": mean_entropy.item(),
     }
     return loss, stats
 
@@ -655,7 +659,10 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
-        all_stats = {"grpo/mean_reward": rewards_t.mean().item()}
+        all_stats = {
+            "grpo/mean_reward": rewards_t.mean().item(),
+            "grpo/group_reward_std": rewards_grouped.std(dim=1).mean().item(),
+        }
 
         model.train()
         for sb in range(num_sub_batches):
