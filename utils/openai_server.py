@@ -17,7 +17,7 @@ _SYNC_LOCK = threading.Lock()
 
 _NCCL_INVALID_USAGE_MESSAGE = (
     "NCCL weight sync failed with 'invalid usage'. This repo supports NCCL weight sync only for "
-    "a multi-GPU trainer with a single-GPU vLLM server, and every trainer rank must participate "
+    "a trainer with a single-GPU vLLM server, and every trainer rank must participate "
     "in the sync call. If you need a fallback, restart the vLLM server with "
     "`./setup/start_vllm.sh <model> <max_model_len> <host> <port> ipc` or pass "
     "`--vllm-weight-sync-backend ipc` to the trainer so both sides match."
@@ -306,7 +306,7 @@ def _ensure_nccl_initialized(
                     "init_info": {
                         "master_address": master_address,
                         "master_port": master_port,
-                        "rank_offset": 0,
+                        "rank_offset": trainer_world_size,
                         "world_size": trainer_world_size + 1,
                     }
                 },
@@ -324,7 +324,7 @@ def _ensure_nccl_initialized(
     context.group = NCCLWeightTransferEngine._stateless_init_process_group(
         master_address,
         master_port,
-        trainer_rank + 1,
+        trainer_rank,
         trainer_world_size + 1,
         device=torch.accelerator.current_device_index(),
     )
@@ -416,7 +416,7 @@ def sync_server_model_weights(
 
                 trainer_args = NCCLTrainerSendWeightsArgs(
                     group=context.group,
-                    src=1,
+                    src=0,
                     packed=True,
                 )
                 NCCLWeightTransferEngine.trainer_send_weights(
