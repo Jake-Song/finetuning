@@ -1,0 +1,5 @@
+dataset_config: "main"
+num_generations: 16
+learning_rate: 3e-6
+max_completion_length: 256
+max_steps: 180
