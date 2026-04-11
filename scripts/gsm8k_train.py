@@ -27,6 +27,7 @@ import gc
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -315,12 +316,15 @@ def compute_grpo_loss(
 
     per_token_loss = advantages.unsqueeze(-1) * token_log_probs * token_mask
     num_valid = token_mask.sum().clamp(min=1)
-    loss = -per_token_loss.sum() / num_valid
+    loss_sum = -per_token_loss.sum()
+    loss = loss_sum / num_valid
     mean_entropy = (token_entropy * token_mask).sum() / num_valid
 
     stats = {
-        "grpo/mean_advantage": advantages.mean().item(),
+        "grpo/mean_abs_advantage": advantages.abs().mean().item(),
         "grpo/entropy": mean_entropy.item(),
+        "_loss_sum": loss_sum.detach().item(),
+        "_num_valid_tokens": num_valid.detach().item(),
     }
     return loss, stats
 
@@ -754,6 +758,7 @@ def main():
 
     try:
         while global_step < cfg.max_steps:
+            step_start_time = time.perf_counter()
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -811,7 +816,8 @@ def main():
             num_sub_batches = (total_seqs + cfg.per_device_train_batch_size - 1) // cfg.per_device_train_batch_size
 
             optimizer.zero_grad(set_to_none=True)
-            total_loss = 0.0
+            total_loss_sum = 0.0
+            total_valid_tokens = 0.0
             all_stats = {
                 "grpo/mean_reward": rewards_t.mean().item(),
                 "grpo/group_reward_std": rewards_grouped.std(dim=1).mean().item(),
@@ -833,7 +839,8 @@ def main():
                 )
                 loss = loss / num_sub_batches
                 loss.backward()
-                total_loss += loss.item()
+                total_loss_sum += stats.pop("_loss_sum")
+                total_valid_tokens += stats.pop("_num_valid_tokens")
 
                 for k, v in stats.items():
                     all_stats[k] = all_stats.get(k, 0.0) + v / num_sub_batches
@@ -842,38 +849,53 @@ def main():
             optimizer.step()
             scheduler.step()
             global_step += 1
+            iter_per_sec = 1.0 / max(time.perf_counter() - step_start_time, 1e-12)
 
             if global_step % cfg.logging_steps == 0:
-                loss_tensor = torch.tensor(total_loss, device=device)
+                loss_sum_t = torch.tensor(total_loss_sum, device=device)
+                valid_tokens_t = torch.tensor(total_valid_tokens, device=device)
                 reward_mean = torch.tensor(all_stats["grpo/mean_reward"], device=device)
                 reward_group_std = torch.tensor(all_stats["grpo/group_reward_std"], device=device)
                 entropy = torch.tensor(all_stats["grpo/entropy"], device=device)
                 format_rate_t = torch.tensor(all_stats["grpo/format_rate"], device=device)
                 exact_rate_t = torch.tensor(all_stats["grpo/exact_match_rate"], device=device)
+                mean_abs_advantage_t = torch.tensor(all_stats["grpo/mean_abs_advantage"], device=device)
+                iter_per_sec_t = torch.tensor(iter_per_sec, device=device)
                 if ddp:
-                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(valid_tokens_t, op=dist.ReduceOp.SUM)
                     dist.all_reduce(reward_mean, op=dist.ReduceOp.AVG)
                     dist.all_reduce(reward_group_std, op=dist.ReduceOp.AVG)
                     dist.all_reduce(entropy, op=dist.ReduceOp.AVG)
                     dist.all_reduce(format_rate_t, op=dist.ReduceOp.AVG)
                     dist.all_reduce(exact_rate_t, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(mean_abs_advantage_t, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(iter_per_sec_t, op=dist.ReduceOp.AVG)
+                loss_value = (loss_sum_t / valid_tokens_t.clamp(min=1)).item()
+                objective_value = -loss_value
                 all_stats["grpo/mean_reward"] = reward_mean.item()
                 all_stats["grpo/group_reward_std"] = reward_group_std.item()
                 all_stats["grpo/entropy"] = entropy.item()
                 all_stats["grpo/format_rate"] = format_rate_t.item()
                 all_stats["grpo/exact_match_rate"] = exact_rate_t.item()
+                all_stats["grpo/mean_abs_advantage"] = mean_abs_advantage_t.item()
+                all_stats["grpo/objective"] = objective_value
+                iter_per_sec = iter_per_sec_t.item()
 
                 current_lr = scheduler.get_last_lr()[0]
                 stats_str = " ".join(f"{k}={v:.4f}" for k, v in all_stats.items())
                 print0(
-                    f"step={global_step}/{cfg.max_steps} loss={loss_tensor.item():.4f} "
-                    f"lr={current_lr:.2e} grad_norm={float(grad_norm):.4f} {stats_str}"
+                    f"step={global_step}/{cfg.max_steps} loss={loss_value:.4f} "
+                    f"lr={current_lr:.2e} grad_norm={float(grad_norm):.4f} "
+                    f"iter/sec={iter_per_sec:.2f} {stats_str}"
                 )
                 wandb_run.log({
                     "step": global_step,
-                    "loss": loss_tensor.item(),
+                    "loss": loss_value,
+                    "grpo/objective": objective_value,
                     "lr": current_lr,
                     "grad_norm": float(grad_norm),
+                    "iter_per_sec": iter_per_sec,
                     **all_stats,
                 })
 
