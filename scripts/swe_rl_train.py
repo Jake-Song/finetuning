@@ -180,6 +180,10 @@ def load_swe_rl_dataset(
     return full, None
 
 
+def resolve_model_source(cfg: TrainConfig, resume_from_checkpoint: str | None = None) -> str:
+    return resume_from_checkpoint or cfg.model_name
+
+
 def _is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -481,7 +485,8 @@ def cleanup_compute() -> None:
         torch.cuda.ipc_collect()
 
 
-def dry_run(cfg: TrainConfig):
+def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
+    model_source = resolve_model_source(cfg, resume_from_checkpoint)
     if os.environ.get("WANDB_API_KEY"):
         print("WANDB_API_KEY is set")
     else:
@@ -492,6 +497,7 @@ def dry_run(cfg: TrainConfig):
 
     print(f"\n[Config]")
     print(f"  model:            {cfg.model_name}")
+    print(f"  model_source:     {model_source}")
     print(f"  dataset:          {cfg.dataset_name} ({cfg.dataset_config})")
     print(f"  max_prompt_len:   {cfg.max_prompt_length}")
     print(f"  num_generations:  {cfg.num_generations}")
@@ -538,7 +544,7 @@ def dry_run(cfg: TrainConfig):
 
     print(f"\n[Tokenizer]")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_source)
         print(f"  vocab_size:  {tokenizer.vocab_size}")
         print(f"  pad_token:   {tokenizer.pad_token}")
         print(f"  eos_token:   {tokenizer.eos_token}")
@@ -606,8 +612,10 @@ def main():
         if hasattr(cfg, k):
             setattr(cfg, k, type(getattr(cfg, k))(v))
 
+    model_source = resolve_model_source(cfg, args.resume_from_checkpoint)
+
     if args.dry_run:
-        dry_run(cfg)
+        dry_run(cfg, args.resume_from_checkpoint)
         return
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -622,7 +630,6 @@ def main():
     if prompts_per_rank < 1:
         raise ValueError("per_device_train_batch_size * gradient_accumulation_steps must be at least 1.")
 
-    model_source = args.resume_from_checkpoint or cfg.model_name
     print0(f"Loading tokenizer from {model_source}...")
     tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
     if tokenizer.pad_token is None:
@@ -657,7 +664,7 @@ def main():
     )
 
     train_dataset, eval_dataset = load_swe_rl_dataset(
-        cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, cfg.model_name, cfg.eval_size
+        cfg.dataset_name, cfg.dataset_config, cfg.max_prompt_length, model_source, cfg.eval_size
     )
     print0(f"Train dataset: {len(train_dataset)} examples")
     if eval_dataset:
