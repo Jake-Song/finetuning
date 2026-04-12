@@ -66,10 +66,10 @@ class TrainConfig:
     max_prompt_length: int = 512
 
     # GRPO
-    num_generations: int = 4
-    per_device_train_batch_size: int = 1
+    num_generations: int = 16
+    per_device_train_batch_size: int = 8
     gradient_accumulation_steps: int = 16
-    max_completion_length: int = 256
+    max_completion_length: int = 512
     learning_rate: float = 3e-6
     epsilon: float = 0.2
     temperature: float = 0.7
@@ -86,13 +86,14 @@ class TrainConfig:
     vllm_sync_timeout: float = 300.0
     vllm_weight_sync_backend: str = "nccl"
     vllm_max_parallel_requests: int = 8
+    vllm_gpu_memory_utilization: float = 0.5
 
-    max_steps: int = 500
+    max_steps: int = 150
     output_dir: str = "./ckpt_grpo_gsm8k"
     save_steps: int = 50
     logging_steps: int = 1
-    eval_steps: int = 200
-    eval_size: int = 100
+    eval_steps: int = 100
+    eval_size: int = 128
     seed: int = 42
 
     # wandb
@@ -679,6 +680,7 @@ def main():
         api_key=cfg.vllm_api_key,
         request_timeout=cfg.vllm_request_timeout,
         max_parallel_requests=cfg.vllm_max_parallel_requests,
+        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
     )
 
     train_dataset, eval_dataset = load_gsm8k_dataset(
