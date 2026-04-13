@@ -90,6 +90,7 @@ class TrainConfig:
 
     max_steps: int = 150
     output_dir: str = "./ckpt_grpo_gsm8k"
+    report_dir: str = "./report"
     save_steps: int = 50
     logging_steps: int = 1
     eval_steps: int = 100
@@ -351,6 +352,103 @@ def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> No
         f.write(f"| {step} | {timestamp} | {values} |\n")
 
 
+def _format_report_metric(value: float | int | None) -> str:
+    if value is None:
+        return "NA"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _sanitize_markdown_cell(value: Any, *, max_length: int | None = None) -> str:
+    text = "NA" if value is None else str(value)
+    text = text.replace("\n", " ").replace("\r", " ").replace("|", "/").strip()
+    text = re.sub(r"\s+", " ", text)
+    if max_length is not None and len(text) > max_length:
+        text = text[: max_length - 3].rstrip() + "..."
+    return text or "NA"
+
+
+def append_experiment_report(report_dir: str, summary: dict[str, Any]) -> None:
+    if not _is_main_process():
+        return
+
+    os.makedirs(report_dir, exist_ok=True)
+    report_path = os.path.join(report_dir, "gsm8k.md")
+    headers = [
+        "Timestamp UTC",
+        "Status",
+        "Run Name",
+        "Model",
+        "Dataset",
+        "Config",
+        "Resume From",
+        "Steps Completed",
+        "Best Step",
+        "Best Exact Match",
+        "Best Format Rate",
+        "Best Mean Reward",
+        "Num Generations",
+        "Per-Device Batch",
+        "Grad Accum",
+        "LR",
+        "Max Completion",
+        "Eval Size",
+        "Output Dir",
+        "Final Checkpoint",
+        "Runtime Min",
+        "Error",
+    ]
+    row = [
+        _sanitize_markdown_cell(summary.get("timestamp_utc")),
+        _sanitize_markdown_cell(summary.get("status")),
+        _sanitize_markdown_cell(summary.get("run_name")),
+        _sanitize_markdown_cell(summary.get("model_name")),
+        _sanitize_markdown_cell(summary.get("dataset")),
+        _sanitize_markdown_cell(summary.get("config_path")),
+        _sanitize_markdown_cell(summary.get("resume_from_checkpoint")),
+        _format_report_metric(summary.get("steps_completed")),
+        _format_report_metric(summary.get("best_step")),
+        _format_report_metric(summary.get("best_exact_match")),
+        _format_report_metric(summary.get("best_format_rate")),
+        _format_report_metric(summary.get("best_mean_reward")),
+        _format_report_metric(summary.get("num_generations")),
+        _format_report_metric(summary.get("per_device_batch_size")),
+        _format_report_metric(summary.get("gradient_accumulation_steps")),
+        _sanitize_markdown_cell(summary.get("learning_rate")),
+        _format_report_metric(summary.get("max_completion_length")),
+        _format_report_metric(summary.get("eval_size")),
+        _sanitize_markdown_cell(summary.get("output_dir")),
+        _sanitize_markdown_cell(summary.get("final_checkpoint")),
+        _sanitize_markdown_cell(summary.get("runtime_min")),
+        _sanitize_markdown_cell(summary.get("error"), max_length=160),
+    ]
+
+    write_header = not os.path.exists(report_path)
+    with open(report_path, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("# GSM8K Experiment Report\n\n")
+            f.write("| " + " | ".join(headers) + " |\n")
+            f.write("|" + "|".join("---" for _ in headers) + "|\n")
+        f.write("| " + " | ".join(row) + " |\n")
+
+
+def _is_better_eval(candidate: dict[str, Any], current_best: dict[str, Any] | None) -> bool:
+    if current_best is None:
+        return True
+    candidate_key = (
+        float(candidate.get("eval/exact_match_rate", float("-inf"))),
+        float(candidate.get("eval/mean_reward", float("-inf"))),
+        int(candidate.get("step", -1)),
+    )
+    current_key = (
+        float(current_best.get("eval/exact_match_rate", float("-inf"))),
+        float(current_best.get("eval/mean_reward", float("-inf"))),
+        int(current_best.get("step", -1)),
+    )
+    return candidate_key > current_key
+
+
 def save_checkpoint(
     checkpoint_dir: str,
     raw_model,
@@ -589,6 +687,7 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps")
     parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples")
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+    parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
     parser.add_argument("--vllm-server-host", type=str, default=None)
     parser.add_argument("--vllm-server-port", type=int, default=None)
     parser.add_argument("--vllm-model-name", type=str, default=None)
@@ -612,6 +711,8 @@ def main():
         overrides["eval_steps"] = args.eval_steps
     if args.eval_size is not None:
         overrides["eval_size"] = args.eval_size
+    if args.report_dir is not None:
+        overrides["report_dir"] = args.report_dir
     if args.vllm_server_host is not None:
         overrides["vllm_server_host"] = args.vllm_server_host
     if args.vllm_server_port is not None:
@@ -757,6 +858,10 @@ def main():
     print0(f"Max steps: {cfg.max_steps}, Warmup: {cfg.warmup_steps}")
 
     data_iter = iter(loader)
+    run_start_time = time.perf_counter()
+    best_eval: dict[str, Any] | None = None
+    final_checkpoint = "NA"
+    run_error: BaseException | None = None
 
     try:
         while global_step < cfg.max_steps:
@@ -918,6 +1023,9 @@ def main():
                     print0(" ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
                     wandb_run.log({"step": global_step, **metrics})
                     append_eval_log(cfg.output_dir, global_step, metrics)
+                    candidate = {"step": global_step, **metrics}
+                    if _is_better_eval(candidate, best_eval):
+                        best_eval = candidate
 
             if master_process and global_step % cfg.save_steps == 0:
                 ckpt_dir = os.path.join(cfg.output_dir, f"step_{global_step}")
@@ -927,8 +1035,42 @@ def main():
         if master_process:
             final_dir = os.path.join(cfg.output_dir, "final")
             save_checkpoint(final_dir, raw_model, tokenizer, optimizer, scheduler, cfg, global_step)
+            final_checkpoint = final_dir
             print0(f"Saved final model to {final_dir}")
+    except BaseException as exc:
+        run_error = exc
+        raise
     finally:
+        if master_process:
+            runtime_min = (time.perf_counter() - run_start_time) / 60.0
+            summary = {
+                "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "status": "failed" if run_error is not None else "success",
+                "run_name": run_name,
+                "model_name": cfg.model_name,
+                "dataset": f"{cfg.dataset_name}:{cfg.dataset_config}",
+                "config_path": args.config or "default",
+                "resume_from_checkpoint": args.resume_from_checkpoint or "NA",
+                "steps_completed": global_step,
+                "best_step": best_eval["step"] if best_eval else None,
+                "best_exact_match": best_eval["eval/exact_match_rate"] if best_eval else None,
+                "best_format_rate": best_eval["eval/format_rate"] if best_eval else None,
+                "best_mean_reward": best_eval["eval/mean_reward"] if best_eval else None,
+                "num_generations": cfg.num_generations,
+                "per_device_batch_size": cfg.per_device_train_batch_size,
+                "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+                "learning_rate": cfg.learning_rate,
+                "max_completion_length": cfg.max_completion_length,
+                "eval_size": cfg.eval_size,
+                "output_dir": cfg.output_dir,
+                "final_checkpoint": final_checkpoint,
+                "runtime_min": f"{runtime_min:.2f}",
+                "error": repr(run_error) if run_error is not None else "",
+            }
+            try:
+                append_experiment_report(cfg.report_dir, summary)
+            except Exception as report_exc:
+                print0(f"Failed to append experiment report: {report_exc}")
         finish_wandb()
         cleanup_compute()
         print0("Training complete.")
