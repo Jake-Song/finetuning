@@ -710,9 +710,9 @@ def main():
     master_process = ddp_rank == 0
     torch.manual_seed(cfg.seed + ddp_rank)
 
-    prompts_per_rank = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
+    prompts_per_rank = cfg.per_device_train_batch_size
     if prompts_per_rank < 1:
-        raise ValueError("per_device_train_batch_size * gradient_accumulation_steps must be at least 1.")
+        raise ValueError("per_device_train_batch_size must be at least 1.")
 
     model_source = args.resume_from_checkpoint or cfg.model_name
     print0(f"Loading tokenizer from {model_source}...")
