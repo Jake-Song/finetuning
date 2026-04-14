@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-Qwen/Qwen2.5-1.5B-Instruct}"
+MODEL="${1:-Qwen/Qwen2.5-3B-Instruct}"
 MAX_MODEL_LEN="${2:-8192}"
 HOST="${3:-0.0.0.0}"
 PORT="${4:-8000}"

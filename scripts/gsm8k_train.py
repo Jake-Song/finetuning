@@ -86,7 +86,6 @@ class TrainConfig:
     vllm_sync_timeout: float = 300.0
     vllm_weight_sync_backend: str = "nccl"
     vllm_max_parallel_requests: int = 8
-    vllm_gpu_memory_utilization: float = 0.5
 
     max_steps: int = 150
     output_dir: str = "./ckpt_grpo_gsm8k"
@@ -780,8 +779,7 @@ def main():
         model_name=request_model_name,
         api_key=cfg.vllm_api_key,
         request_timeout=cfg.vllm_request_timeout,
-        max_parallel_requests=cfg.vllm_max_parallel_requests,
-        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+        max_parallel_requests=cfg.vllm_max_parallel_requests        
     )
 
     train_dataset, eval_dataset = load_gsm8k_dataset(
