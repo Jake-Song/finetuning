@@ -52,6 +52,8 @@ from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model
 
 load_dotenv()
 
+hf_token = os.environ.get("HF_TOKEN")
+
 FINAL_ANSWER_INSTRUCTION = (
     "Solve the following math word problem. You may reason step by step, "
     "but the final line must be exactly in the form `#### <answer>`."
@@ -92,7 +94,7 @@ class TrainConfig:
     report_dir: str = "./report"
     save_steps: int = 50
     logging_steps: int = 1
-    eval_steps: int = 100
+    eval_steps: int = 50
     eval_size: int = 128
     seed: int = 42
 
@@ -196,17 +198,6 @@ def load_gsm8k_dataset(
 
 def resolve_model_source(cfg: TrainConfig, resume_from_checkpoint: str | None = None) -> str:
     return resume_from_checkpoint or cfg.model_name
-
-
-def resolve_hf_token(cfg: TrainConfig) -> str | None:
-    return (
-        cfg.hf_token
-        or os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("hf_token")
-        or None
-    )
-
 
 def _is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
@@ -615,7 +606,6 @@ def cleanup_compute() -> None:
 
 def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     model_source = resolve_model_source(cfg, resume_from_checkpoint)
-    hf_token = resolve_hf_token(cfg)
     if os.environ.get("WANDB_API_KEY"):
         print("WANDB_API_KEY is set")
     else:
@@ -645,8 +635,8 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
-        hf_token,
-        cfg.eval_size,
+        hf_token=hf_token,
+        eval_size=cfg.eval_size,
     )
     print(f"  train samples: {len(train_dataset)}")
     print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
@@ -749,8 +739,7 @@ def main():
             setattr(cfg, k, type(getattr(cfg, k))(v))
 
     model_source = resolve_model_source(cfg, args.resume_from_checkpoint)
-    hf_token = resolve_hf_token(cfg)
-
+    
     if args.dry_run:
         dry_run(cfg, args.resume_from_checkpoint)
         return
@@ -806,8 +795,8 @@ def main():
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
-        hf_token,
-        cfg.eval_size,
+        hf_token=hf_token,
+        eval_size=cfg.eval_size,
     )
     print0(f"Train dataset: {len(train_dataset)} examples")
     if eval_dataset:
