@@ -69,7 +69,6 @@ class TrainConfig:
     # GRPO
     num_generations: int = 16
     per_device_train_batch_size: int = 8
-    gradient_accumulation_steps: int = 16
     max_completion_length: int = 256
     learning_rate: float = 3e-6
     epsilon: float = 0.2
@@ -401,7 +400,6 @@ def append_experiment_report(report_dir: str, summary: dict[str, Any]) -> None:
         "Best Mean Reward",
         "Num Generations",
         "Per-Device Batch",
-        "Grad Accum",
         "LR",
         "Max Completion",
         "Eval Size",
@@ -425,7 +423,6 @@ def append_experiment_report(report_dir: str, summary: dict[str, Any]) -> None:
         _format_report_metric(summary.get("best_mean_reward")),
         _format_report_metric(summary.get("num_generations")),
         _format_report_metric(summary.get("per_device_batch_size")),
-        _format_report_metric(summary.get("gradient_accumulation_steps")),
         _sanitize_markdown_cell(summary.get("learning_rate")),
         _format_report_metric(summary.get("max_completion_length")),
         _format_report_metric(summary.get("eval_size")),
@@ -634,7 +631,6 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     print(f"  max_prompt_len:   {cfg.max_prompt_length}")
     print(f"  num_generations:  {cfg.num_generations}")
     print(f"  batch_size:       {cfg.per_device_train_batch_size}")
-    print(f"  grad_accum:       {cfg.gradient_accumulation_steps}")
     print(f"  max_completion:   {cfg.max_completion_length}")
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
@@ -767,9 +763,9 @@ def main():
     master_process = ddp_rank == 0
     torch.manual_seed(cfg.seed + ddp_rank)
 
-    prompts_per_rank = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps
+    prompts_per_rank = cfg.per_device_train_batch_size
     if prompts_per_rank < 1:
-        raise ValueError("per_device_train_batch_size * gradient_accumulation_steps must be at least 1.")
+        raise ValueError("per_device_train_batch_size must be at least 1.")
 
     print0(f"Loading tokenizer from {model_source}...")
     tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, token=hf_token)
@@ -865,7 +861,6 @@ def main():
         f"gsm8k_{model_short}"
         f"_g{cfg.num_generations}"
         f"_bs{cfg.per_device_train_batch_size}"
-        f"_ga{cfg.gradient_accumulation_steps}"
         f"_lr{cfg.learning_rate}"
     )
 
@@ -1080,7 +1075,6 @@ def main():
                 "best_mean_reward": best_eval["eval/mean_reward"] if best_eval else None,
                 "num_generations": cfg.num_generations,
                 "per_device_batch_size": cfg.per_device_train_batch_size,
-                "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
                 "learning_rate": cfg.learning_rate,
                 "max_completion_length": cfg.max_completion_length,
                 "eval_size": cfg.eval_size,
