@@ -61,6 +61,7 @@ FINAL_ANSWER_INSTRUCTION = (
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    hf_token: str = ""
     dataset_name: str = "openai/gsm8k"
     dataset_config: str = "main"
     max_prompt_length: int = 512
@@ -157,10 +158,11 @@ def load_gsm8k_dataset(
     config: str,
     max_prompt_length: int,
     tokenizer_name: str,
+    hf_token: str | None = None,
     eval_size: int = 100,
 ) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(name, config, split="train")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token)
 
     rows = []
     for example in ds:
@@ -195,6 +197,16 @@ def load_gsm8k_dataset(
 
 def resolve_model_source(cfg: TrainConfig, resume_from_checkpoint: str | None = None) -> str:
     return resume_from_checkpoint or cfg.model_name
+
+
+def resolve_hf_token(cfg: TrainConfig) -> str | None:
+    return (
+        cfg.hf_token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("hf_token")
+        or None
+    )
 
 
 def _is_main_process() -> bool:
@@ -606,6 +618,7 @@ def cleanup_compute() -> None:
 
 def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     model_source = resolve_model_source(cfg, resume_from_checkpoint)
+    hf_token = resolve_hf_token(cfg)
     if os.environ.get("WANDB_API_KEY"):
         print("WANDB_API_KEY is set")
     else:
@@ -628,6 +641,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     print(f"  output_dir:       {cfg.output_dir}")
     print(f"  vllm_server:      {cfg.vllm_server_host}:{cfg.vllm_server_port}")
     print(f"  vllm_sync:        {cfg.vllm_weight_sync_backend}")
+    print(f"  hf_token:         {'set' if hf_token else 'not set'}")
 
     print(f"\n[Dataset]")
     train_dataset, eval_dataset = load_gsm8k_dataset(
@@ -635,6 +649,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
+        hf_token,
         cfg.eval_size,
     )
     print(f"  train samples: {len(train_dataset)}")
@@ -660,7 +675,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
 
     print(f"\n[Tokenizer]")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_source)
+        tokenizer = AutoTokenizer.from_pretrained(model_source, token=hf_token)
         print(f"  vocab_size:  {tokenizer.vocab_size}")
         print(f"  pad_token:   {tokenizer.pad_token}")
         print(f"  eos_token:   {tokenizer.eos_token}")
@@ -687,6 +702,7 @@ def main():
     parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples")
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
     parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
+    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face token for private model access")
     parser.add_argument("--vllm-server-host", type=str, default=None)
     parser.add_argument("--vllm-server-port", type=int, default=None)
     parser.add_argument("--vllm-model-name", type=str, default=None)
@@ -712,6 +728,8 @@ def main():
         overrides["eval_size"] = args.eval_size
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
+    if args.hf_token is not None:
+        overrides["hf_token"] = args.hf_token
     if args.vllm_server_host is not None:
         overrides["vllm_server_host"] = args.vllm_server_host
     if args.vllm_server_port is not None:
@@ -732,6 +750,7 @@ def main():
             setattr(cfg, k, type(getattr(cfg, k))(v))
 
     model_source = resolve_model_source(cfg, args.resume_from_checkpoint)
+    hf_token = resolve_hf_token(cfg)
 
     if args.dry_run:
         dry_run(cfg, args.resume_from_checkpoint)
@@ -750,7 +769,7 @@ def main():
         raise ValueError("per_device_train_batch_size * gradient_accumulation_steps must be at least 1.")
 
     print0(f"Loading tokenizer from {model_source}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -758,6 +777,7 @@ def main():
     model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
+        token=hf_token,
         torch_dtype=model_dtype,
         attn_implementation="sdpa",
     )
@@ -787,6 +807,7 @@ def main():
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
+        hf_token,
         cfg.eval_size,
     )
     print0(f"Train dataset: {len(train_dataset)} examples")
