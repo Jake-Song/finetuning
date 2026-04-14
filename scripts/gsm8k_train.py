@@ -60,17 +60,17 @@ FINAL_ANSWER_INSTRUCTION = (
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
     hf_token: str = ""
     dataset_name: str = "openai/gsm8k"
     dataset_config: str = "main"
-    max_prompt_length: int = 512
+    max_prompt_length: int = 256
 
     # GRPO
     num_generations: int = 16
     per_device_train_batch_size: int = 8
     gradient_accumulation_steps: int = 16
-    max_completion_length: int = 512
+    max_completion_length: int = 256
     learning_rate: float = 3e-6
     epsilon: float = 0.2
     temperature: float = 0.7
@@ -698,6 +698,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps")
     parser.add_argument("--eval-steps", type=int, default=None, help="Run eval every N steps")
     parser.add_argument("--eval-size", type=int, default=None, help="Number of eval examples")
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
@@ -722,6 +723,8 @@ def main():
         overrides["report_to"] = "wandb"
         if args.run:
             overrides["wandb_project"] = args.run
+    if args.max_steps is not None:
+        overrides["max_steps"] = args.max_steps
     if args.eval_steps is not None:
         overrides["eval_steps"] = args.eval_steps
     if args.eval_size is not None:

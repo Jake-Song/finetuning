@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 MODEL="${1:-Qwen/Qwen2.5-3B-Instruct}"
-MAX_MODEL_LEN="${2:-8192}"
+MAX_MODEL_LEN="${2:-1024}"
 HOST="${3:-0.0.0.0}"
 PORT="${4:-8000}"
 SYNC_BACKEND="${5:-nccl}"
