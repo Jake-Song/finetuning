@@ -827,6 +827,10 @@ def main() -> None:
     if args.config:
         with open(args.config, encoding="utf-8") as f:
             overrides = yaml.safe_load(f) or {}
+    if args.run is not None:
+        overrides["report_to"] = "wandb"
+        if args.run:
+            overrides["wandb_project"] = args.run
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
     if args.report_dir is not None:
@@ -843,7 +847,7 @@ def main() -> None:
         dry_run(cfg, args.resume_from_checkpoint)
         return
 
-    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+    device_type = autodetect_device_type()
     if device_type != "cuda":
         raise ValueError("This native rewrite keeps vLLM rollouts and requires CUDA.")
 
@@ -920,9 +924,14 @@ def main() -> None:
     )
 
     def get_lr_lambda(step: int) -> float:
+        if cfg.lr_scheduler_type != "linear":
+            return 1.0
         if step < cfg.warmup_steps:
-            return cfg.init_lr_frac + (1.0 - cfg.init_lr_frac) * step / max(cfg.warmup_steps, 1)
-        return 1.0
+            return (step + 1) / max(cfg.warmup_steps, 1)
+        remaining_steps = max(cfg.max_steps - cfg.warmup_steps, 1)
+        decay_step = min(step - cfg.warmup_steps, remaining_steps)
+        return max(0.0, 1.0 - decay_step / remaining_steps)
+
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
 
