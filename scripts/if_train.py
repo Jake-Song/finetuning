@@ -93,6 +93,9 @@ class TrainConfig:
     eval_steps: int = 50
     eval_size: int = 200
     seed: int = 42
+    sample_output_jsonl: str = ""
+    sample_log_every: int = 0
+    sample_prompts_per_capture: int = 1
 
     # wandb
     report_to: str = "none"
@@ -254,6 +257,17 @@ CHECKERS = {
     "startend:quotation": check_quotation,
     "combination:repeat_prompt": check_repeat_prompt,
 }
+
+
+def evaluate_constraints(text: str, instruction_ids: list[str], kwargs_list: list[dict]) -> dict[str, bool | None]:
+    results = {}
+    for constraint_id, kw in zip(instruction_ids, kwargs_list):
+        checker = CHECKERS.get(constraint_id)
+        if checker is None:
+            results[constraint_id] = None
+        else:
+            results[constraint_id] = checker(text, kw)
+    return results
 
 
 def compute_rewards(
@@ -549,6 +563,66 @@ def append_experiment_report(report_dir: str, summary: dict[str, Any]) -> None:
             f.write("| " + " | ".join(headers) + " |\n")
             f.write("|" + "|".join("---" for _ in headers) + "|\n")
         f.write("| " + " | ".join(row) + " |\n")
+
+
+def resolve_sample_log_path(output_dir: str, sample_output_jsonl: str) -> str:
+    sample_output_jsonl = sample_output_jsonl.strip()
+    if not sample_output_jsonl:
+        return ""
+    if os.path.isabs(sample_output_jsonl):
+        return sample_output_jsonl
+    return os.path.join(output_dir, sample_output_jsonl)
+
+
+def append_training_samples_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
+    if not path or not rows or not _is_main_process():
+        return
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def build_training_sample_rows(
+    *,
+    step: int,
+    prompts: list[str],
+    instruction_ids_per_prompt: list[list[str]],
+    kwargs_per_prompt: list[list[dict]],
+    completions_text: list[str],
+    rewards: list[float],
+    num_generations: int,
+    sample_prompts_per_capture: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    prompts_to_log = min(sample_prompts_per_capture, len(prompts))
+    for prompt_idx in range(prompts_to_log):
+        seq_start = prompt_idx * num_generations
+        seq_end = seq_start + num_generations
+        ids = instruction_ids_per_prompt[prompt_idx]
+        kws = kwargs_per_prompt[prompt_idx]
+        samples = []
+        for generation_index, (completion, reward) in enumerate(
+            zip(completions_text[seq_start:seq_end], rewards[seq_start:seq_end], strict=False)
+        ):
+            constraint_results = evaluate_constraints(completion.strip(), ids, kws)
+            samples.append({
+                "generation_index": generation_index,
+                "completion": completion,
+                "reward": reward,
+                "all_passed": bool(len(ids) > 0 and reward >= 1.0),
+                "constraint_results": constraint_results,
+            })
+        rows.append({
+            "step": step,
+            "prompt": prompts[prompt_idx],
+            "instruction_id_list": ids,
+            "kwargs": kws,
+            "num_generations": num_generations,
+            "samples": samples,
+        })
+    return rows
 
 
 def _is_better_eval(candidate: dict[str, Any], current_best: dict[str, Any] | None) -> bool:
@@ -958,6 +1032,9 @@ def main() -> None:
 
     print0(f"Prompts per rank: {prompts_per_rank}, Generations per prompt: {cfg.num_generations}")
     print0(f"Max steps: {cfg.max_steps}, Warmup: {cfg.warmup_steps}")
+    sample_log_path = resolve_sample_log_path(cfg.output_dir, cfg.sample_output_jsonl)
+    if sample_log_path:
+        print0(f"Training samples JSONL: {sample_log_path} (every {cfg.sample_log_every} steps)")
 
     data_iter = iter(loader)
     run_start_time = time.perf_counter()
@@ -1004,9 +1081,13 @@ def main() -> None:
 
             ids_expanded = []
             kwargs_expanded = []
+            ids_per_prompt = []
+            kwargs_per_prompt = []
             for prompt_idx in range(len(prompts)):
                 ids = json.loads(batch["instruction_id_list"][prompt_idx])
                 kws = json.loads(batch["kwargs"][prompt_idx])
+                ids_per_prompt.append(ids)
+                kwargs_per_prompt.append(kws)
                 ids_expanded.extend([ids] * cfg.num_generations)
                 kwargs_expanded.extend([kws] * cfg.num_generations)
 
@@ -1059,6 +1140,19 @@ def main() -> None:
             scheduler.step()
             global_step += 1
             iter_per_sec = 1.0 / max(time.perf_counter() - step_start_time, 1e-12)
+
+            if sample_log_path and cfg.sample_log_every > 0 and global_step % cfg.sample_log_every == 0:
+                sample_rows = build_training_sample_rows(
+                    step=global_step,
+                    prompts=prompts,
+                    instruction_ids_per_prompt=ids_per_prompt,
+                    kwargs_per_prompt=kwargs_per_prompt,
+                    completions_text=completions_text,
+                    rewards=rewards,
+                    num_generations=cfg.num_generations,
+                    sample_prompts_per_capture=cfg.sample_prompts_per_capture,
+                )
+                append_training_samples_jsonl(sample_log_path, sample_rows)
 
             if global_step % cfg.log_every == 0:
                 loss_sum_t = torch.tensor(total_loss_sum, device=device)
