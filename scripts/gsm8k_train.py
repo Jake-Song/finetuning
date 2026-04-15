@@ -52,7 +52,7 @@ from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model
 
 load_dotenv()
 
-hf_token = os.environ.get("HF_TOKEN")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 FINAL_ANSWER_INSTRUCTION = (
     "Solve the following math word problem. You may reason step by step, "
@@ -63,7 +63,6 @@ FINAL_ANSWER_INSTRUCTION = (
 @dataclass
 class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-3B-Instruct"
-    hf_token: str = ""
     dataset_name: str = "openai/gsm8k"
     dataset_config: str = "main"
     max_prompt_length: int = 256
@@ -101,7 +100,6 @@ class TrainConfig:
     # wandb
     report_to: str = "none"
     wandb_project: str = "grpo-gsm8k"
-    wandb_entity: str = ""
     wandb_mode: str = "online"
 
 
@@ -159,11 +157,10 @@ def load_gsm8k_dataset(
     config: str,
     max_prompt_length: int,
     tokenizer_name: str,
-    hf_token: str | None = None,
     eval_size: int = 100,
 ) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(name, config, split="train")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=HF_TOKEN)
 
     rows = []
     for example in ds:
@@ -220,9 +217,7 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
         ) from e
 
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
-    if cfg.wandb_entity:
-        os.environ["WANDB_ENTITY"] = cfg.wandb_entity
-
+    
     api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
     wandb_mode = cfg.wandb_mode
     if not api_key and str(wandb_mode).lower() == "online":
@@ -244,8 +239,6 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
             "mode": wandb_mode,
             "config": asdict(cfg),
         }
-        if cfg.wandb_entity:
-            init_kwargs["entity"] = cfg.wandb_entity
         wandb.init(**init_kwargs)
 
 
@@ -627,7 +620,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     print(f"  output_dir:       {cfg.output_dir}")
     print(f"  vllm_server:      {cfg.vllm_server_host}:{cfg.vllm_server_port}")
     print(f"  vllm_sync:        {cfg.vllm_weight_sync_backend}")
-    print(f"  hf_token:         {'set' if hf_token else 'not set'}")
+    print(f"  hf_token:         {'set' if HF_TOKEN else 'not set'}")
 
     print(f"\n[Dataset]")
     train_dataset, eval_dataset = load_gsm8k_dataset(
@@ -635,7 +628,6 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
-        hf_token=hf_token,
         eval_size=cfg.eval_size,
     )
     print(f"  train samples: {len(train_dataset)}")
@@ -661,7 +653,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
 
     print(f"\n[Tokenizer]")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_source, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(model_source, token=HF_TOKEN)
         print(f"  vocab_size:  {tokenizer.vocab_size}")
         print(f"  pad_token:   {tokenizer.pad_token}")
         print(f"  eos_token:   {tokenizer.eos_token}")
@@ -711,29 +703,9 @@ def main():
             overrides["wandb_project"] = args.run
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
-    if args.eval_steps is not None:
-        overrides["eval_steps"] = args.eval_steps
-    if args.eval_size is not None:
-        overrides["eval_size"] = args.eval_size
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
-    if args.hf_token is not None:
-        overrides["hf_token"] = args.hf_token
-    if args.vllm_server_host is not None:
-        overrides["vllm_server_host"] = args.vllm_server_host
-    if args.vllm_server_port is not None:
-        overrides["vllm_server_port"] = args.vllm_server_port
-    if args.vllm_model_name is not None:
-        overrides["vllm_model_name_for_requests"] = args.vllm_model_name
-    if args.vllm_api_key is not None:
-        overrides["vllm_api_key"] = args.vllm_api_key
-    if args.vllm_request_timeout is not None:
-        overrides["vllm_request_timeout"] = args.vllm_request_timeout
-    if args.vllm_sync_timeout is not None:
-        overrides["vllm_sync_timeout"] = args.vllm_sync_timeout
-    if args.vllm_weight_sync_backend is not None:
-        overrides["vllm_weight_sync_backend"] = args.vllm_weight_sync_backend
-
+    
     for k, v in overrides.items():
         if hasattr(cfg, k):
             setattr(cfg, k, type(getattr(cfg, k))(v))
@@ -757,7 +729,7 @@ def main():
         raise ValueError("per_device_train_batch_size must be at least 1.")
 
     print0(f"Loading tokenizer from {model_source}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, token=HF_TOKEN)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -765,7 +737,7 @@ def main():
     model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
-        token=hf_token,
+        token=HF_TOKEN,
         torch_dtype=model_dtype,
         attn_implementation="sdpa",
     )
@@ -795,7 +767,6 @@ def main():
         cfg.dataset_config,
         cfg.max_prompt_length,
         model_source,
-        hf_token=hf_token,
         eval_size=cfg.eval_size,
     )
     print0(f"Train dataset: {len(train_dataset)} examples")
