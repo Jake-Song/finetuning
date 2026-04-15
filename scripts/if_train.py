@@ -55,14 +55,14 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "IF-RL"
-    max_prompt_length: int = 512
+    max_prompt_length: int = 2048
 
     # GRPO
-    num_generations: int = 4
-    max_completion_length: int = 512
+    num_generations: int = 16
+    max_completion_length: int = 2048
     temperature: float = 0.7
     top_p: float = 1.0
 
@@ -77,9 +77,8 @@ class TrainConfig:
     vllm_max_parallel_requests: int = 8
 
     # Optimization
-    batch_size: int = 128
-    per_device_batch_size: int = 8
-    learning_rate: float = 1e-6
+    per_device_train_batch_size: int = 8
+    learning_rate: float = 3e-6
     warmup_steps: int = 10
     init_lr_frac: float = 0.1
     weight_decay: float = 0.0
@@ -95,7 +94,6 @@ class TrainConfig:
     seed: int = 42
 
     # wandb
-    run_name: str = "dummy"
     report_to: str = "none"
     wandb_project: str = "grpo-ifeval"
     wandb_mode: str = "online"
@@ -332,20 +330,6 @@ def _wandb_enabled(report_to: str) -> bool:
     targets = {target.strip().lower() for target in report_to.split(",")}
     return "wandb" in targets
 
-
-def build_run_name(cfg: TrainConfig) -> str:
-    if cfg.run_name and cfg.run_name != "dummy":
-        return cfg.run_name
-    model_short = cfg.model_name.split("/")[-1]
-    return (
-        f"ifeval_{model_short}"
-        f"_g{cfg.num_generations}"
-        f"_bs{cfg.batch_size}"
-        f"_mb{cfg.per_device_batch_size}"
-        f"_lr{cfg.learning_rate}"
-    )
-
-
 def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
     if not _wandb_enabled(cfg.report_to) or not _is_main_process():
         return
@@ -358,7 +342,7 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
         ) from e
 
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
-
+    
     api_key = (os.environ.get("WANDB_API_KEY") or "").strip()
     wandb_mode = cfg.wandb_mode
     if not api_key and str(wandb_mode).lower() == "online":
@@ -374,12 +358,13 @@ def setup_wandb(cfg: TrainConfig, run_name: str) -> None:
         wandb.login(key=api_key, relogin=True)
 
     if wandb.run is None:
-        wandb.init(
-            project=cfg.wandb_project,
-            name=run_name,
-            mode=wandb_mode,
-            config=asdict(cfg),
-        )
+        init_kwargs: dict[str, Any] = {
+            "project": cfg.wandb_project,
+            "name": run_name,
+            "mode": wandb_mode,
+            "config": asdict(cfg),
+        }
+        wandb.init(**init_kwargs)
 
 
 def finish_wandb() -> None:
@@ -546,8 +531,7 @@ def append_experiment_report(report_dir: str, summary: dict[str, Any]) -> None:
         _format_report_metric(summary.get("best_full_constraint_rate")),
         _format_report_metric(summary.get("best_mean_reward")),
         _format_report_metric(summary.get("num_generations")),
-        _format_report_metric(summary.get("batch_size")),
-        _format_report_metric(summary.get("per_device_batch_size")),
+        _format_report_metric(summary.get("per_device_train_batch_size")),
         _sanitize_markdown_cell(summary.get("learning_rate")),
         _format_report_metric(summary.get("max_completion_length")),
         _format_report_metric(summary.get("eval_size")),
@@ -656,7 +640,7 @@ def run_eval(
     if ddp:
         dist.barrier()
 
-    prompts_per_rank = max(1, cfg.batch_size // ddp_world_size)
+    prompts_per_rank = cfg.per_device_train_batch_size
     sampler = (
         DistributedSampler(
             eval_dataset,
@@ -752,8 +736,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None) -> None
     print(f"  dataset:          {cfg.dataset_name} ({cfg.dataset_config})")
     print(f"  max_prompt_len:   {cfg.max_prompt_length}")
     print(f"  num_generations:  {cfg.num_generations}")
-    print(f"  batch_size:       {cfg.batch_size}")
-    print(f"  per_device_bs:    {cfg.per_device_batch_size}")
+    print(f"  per_device_bs:    {cfg.per_device_train_batch_size}")
     print(f"  max_completion:   {cfg.max_completion_length}")
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
@@ -832,22 +815,10 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
-    parser.add_argument("--run", type=str, default="dummy", help="W&B run name ('dummy' disables)")
-    parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-    parser.add_argument("--num-generations", type=int, default=None)
+    parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--eval-steps", type=int, default=None)
-    parser.add_argument("--eval-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
-    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face token for private model access")
-    parser.add_argument("--vllm-server-host", type=str, default=None)
-    parser.add_argument("--vllm-server-port", type=int, default=None)
-    parser.add_argument("--vllm-model-name", type=str, default=None)
-    parser.add_argument("--vllm-api-key", type=str, default=None)
-    parser.add_argument("--vllm-request-timeout", type=float, default=None)
-    parser.add_argument("--vllm-sync-timeout", type=float, default=None)
-    parser.add_argument("--vllm-weight-sync-backend", type=str, default=None)
+   
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -856,47 +827,18 @@ def main() -> None:
     if args.config:
         with open(args.config, encoding="utf-8") as f:
             overrides = yaml.safe_load(f) or {}
-    if args.run != "dummy":
-        overrides["report_to"] = "wandb"
-        overrides["run_name"] = args.run
-    if args.num_generations is not None:
-        overrides["num_generations"] = args.num_generations
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
-    if args.eval_steps is not None:
-        overrides["eval_steps"] = args.eval_steps
-    if args.eval_size is not None:
-        overrides["eval_size"] = args.eval_size
-    if args.lr is not None:
-        overrides["learning_rate"] = args.lr
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
-    if args.vllm_server_host is not None:
-        overrides["vllm_server_host"] = args.vllm_server_host
-    if args.vllm_server_port is not None:
-        overrides["vllm_server_port"] = args.vllm_server_port
-    if args.vllm_model_name is not None:
-        overrides["vllm_model_name_for_requests"] = args.vllm_model_name
-    if args.vllm_api_key is not None:
-        overrides["vllm_api_key"] = args.vllm_api_key
-    if args.vllm_request_timeout is not None:
-        overrides["vllm_request_timeout"] = args.vllm_request_timeout
-    if args.vllm_sync_timeout is not None:
-        overrides["vllm_sync_timeout"] = args.vllm_sync_timeout
-    if args.vllm_weight_sync_backend is not None:
-        overrides["vllm_weight_sync_backend"] = args.vllm_weight_sync_backend
+  
 
     for key, value in overrides.items():
         if hasattr(cfg, key):
             setattr(cfg, key, type(getattr(cfg, key))(value))
 
-    if args.hf_token is not None:
-        global HF_TOKEN
-        HF_TOKEN = args.hf_token
-
     model_source = resolve_model_source(cfg, args.resume_from_checkpoint)
-    run_name = build_run_name(cfg)
-
+  
     if args.dry_run:
         dry_run(cfg, args.resume_from_checkpoint)
         return
@@ -909,13 +851,7 @@ def main() -> None:
     master_process = ddp_rank == 0
     torch.manual_seed(cfg.seed + ddp_rank)
 
-    prompts_per_rank = cfg.batch_size // ddp_world_size
-    if prompts_per_rank < 1:
-        raise ValueError("batch_size must be at least the distributed world size.")
-    if cfg.batch_size % ddp_world_size != 0:
-        raise ValueError("batch_size must be divisible by the distributed world size.")
-    if cfg.per_device_batch_size < 1:
-        raise ValueError("per_device_batch_size must be at least 1.")
+    prompts_per_rank = cfg.per_device_train_batch_size
 
     print0(f"Loading tokenizer from {model_source}...")
     tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True, token=HF_TOKEN)
@@ -995,6 +931,14 @@ def main() -> None:
         global_step = load_training_state(args.resume_from_checkpoint, optimizer, scheduler, device)
         print0(f"Resumed optimizer/scheduler state from {args.resume_from_checkpoint} at step {global_step}")
 
+    model_short = cfg.model_name.split("/")[-1]
+    run_name = (
+        f"ifeval_{model_short}"
+        f"_g{cfg.num_generations}"
+        f"_bs{cfg.per_device_train_batch_size}"
+        f"_lr{cfg.learning_rate}"
+    )
+
     setup_wandb(cfg, run_name)
     wandb_run = DummyWandb()
     if _wandb_enabled(cfg.report_to) and master_process:
@@ -1070,7 +1014,7 @@ def main() -> None:
             completion_mask = completion_mask.to(device)
 
             total_seqs = input_ids.shape[0]
-            num_sub_batches = math.ceil(total_seqs / cfg.per_device_batch_size)
+            num_sub_batches = math.ceil(total_seqs / cfg.per_device_train_batch_size)
 
             optimizer.zero_grad(set_to_none=True)
             total_loss_sum = 0.0
@@ -1082,8 +1026,8 @@ def main() -> None:
 
             model.train()
             for sb in range(num_sub_batches):
-                b0 = sb * cfg.per_device_batch_size
-                b1 = min(b0 + cfg.per_device_batch_size, total_seqs)
+                b0 = sb * cfg.per_device_train_batch_size
+                b1 = min(b0 + cfg.per_device_train_batch_size, total_seqs)
 
                 loss, stats = compute_grpo_loss(
                     model,
@@ -1197,8 +1141,7 @@ def main() -> None:
                 "best_full_constraint_rate": best_eval["eval/full_constraint_rate"] if best_eval else None,
                 "best_mean_reward": best_eval["eval/mean_reward"] if best_eval else None,
                 "num_generations": cfg.num_generations,
-                "batch_size": cfg.batch_size,
-                "per_device_batch_size": cfg.per_device_batch_size,
+                "per_device_train_batch_size": cfg.per_device_train_batch_size,
                 "learning_rate": cfg.learning_rate,
                 "max_completion_length": cfg.max_completion_length,
                 "eval_size": cfg.eval_size,
