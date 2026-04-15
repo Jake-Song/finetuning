@@ -93,7 +93,7 @@ class TrainConfig:
     eval_steps: int = 50
     eval_size: int = 200
     seed: int = 42
-    sample_output_jsonl: str = ""
+    sample_output_jsonl: str = "samples.jsonl"
     sample_log_every: int = 0
     sample_prompts_per_capture: int = 1
 
@@ -893,6 +893,8 @@ def main() -> None:
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
+    parser.add_argument("--sample-output-jsonl", type=str, default=None, help="Relative or absolute JSONL path for logged training samples")
+    parser.add_argument("--sample-log-every", type=int, default=None, help="Capture training samples every N steps (0 disables)")
    
     args = parser.parse_args()
 
@@ -910,6 +912,10 @@ def main() -> None:
         overrides["max_steps"] = args.max_steps
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
+    if args.sample_output_jsonl is not None:
+        overrides["sample_output_jsonl"] = args.sample_output_jsonl
+    if args.sample_log_every is not None:
+        overrides["sample_log_every"] = args.sample_log_every
   
 
     for key, value in overrides.items():
@@ -1141,7 +1147,7 @@ def main() -> None:
             global_step += 1
             iter_per_sec = 1.0 / max(time.perf_counter() - step_start_time, 1e-12)
 
-            if sample_log_path and cfg.sample_log_every > 0 and global_step % cfg.sample_log_every == 0:
+            if sample_log_path:
                 sample_rows = build_training_sample_rows(
                     step=global_step,
                     prompts=prompts,
