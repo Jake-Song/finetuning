@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -15,8 +16,8 @@ def main() -> None:
         "path",
         nargs="?",
         type=Path,
-        default=Path("sample.jsonl"),
-        help="JSONL file (default: sample.jsonl in cwd)",
+        default=None,
+        help="JSONL file (omit to read from stdin)",
     )
     p.add_argument(
         "-o",
@@ -33,9 +34,19 @@ def main() -> None:
     )
     args = p.parse_args()
 
+    if args.path is not None and not args.path.is_file():
+        p.error(f"not a file or missing: {args.path.resolve()}")
+
+    src_label = str(args.path) if args.path is not None else "<stdin>"
+
     out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
     try:
-        with args.path.open(encoding="utf-8") as f:
+        ctx = (
+            args.path.open(encoding="utf-8")
+            if args.path is not None
+            else nullcontext(sys.stdin)
+        )
+        with ctx as f:
             for i, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
@@ -43,7 +54,7 @@ def main() -> None:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError as e:
-                    print(f"{args.path}:{i}: JSON decode error: {e}", file=sys.stderr)
+                    print(f"{src_label}:{i}: JSON decode error: {e}", file=sys.stderr)
                     sys.exit(1)
                 if i > 1:
                     out.write("\n")

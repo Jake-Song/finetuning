@@ -948,7 +948,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         token=HF_TOKEN,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
         attn_implementation="sdpa",
     )
     model.config.use_cache = False
