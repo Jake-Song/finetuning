@@ -705,7 +705,7 @@ def main():
         dry_run(cfg, args.resume_from_checkpoint)
         return
 
-    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+    device_type = autodetect_device_type()
     if device_type != "cuda":
         raise ValueError("This native rewrite keeps vLLM rollouts and requires CUDA.")
 
@@ -727,7 +727,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         token=HF_TOKEN,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
         attn_implementation="sdpa",
     )
     model.config.use_cache = False
