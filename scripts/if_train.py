@@ -32,6 +32,7 @@ import gc
 import json
 import math
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import re
 import string
 import time
@@ -122,7 +123,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
 
-    max_steps: int = 100
+    max_steps: int = 150
     output_dir: str = "./ckpt_grpo_ifeval"
     report_dir: str = "./report"
     save_every: int = 50
@@ -687,7 +688,7 @@ def compute_grpo_loss(
     attention_mask: torch.Tensor,
     completion_mask: torch.Tensor,
     advantages: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     logits = logits[:, :-1, :]
     targets = input_ids[:, 1:]
@@ -701,7 +702,6 @@ def compute_grpo_loss(
     per_token_loss = advantages.unsqueeze(-1) * token_log_probs * token_mask
     num_valid = token_mask.sum().clamp(min=1)
     loss_sum = -per_token_loss.sum()
-    loss = loss_sum / num_valid
     mean_entropy = (token_entropy * token_mask).sum() / num_valid
 
     stats = {
@@ -710,7 +710,7 @@ def compute_grpo_loss(
         "_loss_sum": loss_sum.detach().item(),
         "_num_valid_tokens": num_valid.detach().item(),
     }
-    return loss, stats
+    return loss_sum, num_valid, stats
 
 
 def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> None:
@@ -1371,6 +1371,10 @@ def main() -> None:
 
             total_seqs = input_ids.shape[0]
             num_sub_batches = math.ceil(total_seqs / cfg.per_device_train_batch_size)
+            local_valid_tokens = completion_mask[:, 1:].sum().clamp(min=1).to(device=device, dtype=torch.float32)
+            global_valid_tokens = local_valid_tokens.clone()
+            if ddp:
+                dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM)
 
             optimizer.zero_grad(set_to_none=True)
             total_loss_sum = 0.0
@@ -1385,14 +1389,16 @@ def main() -> None:
                 b0 = sb * cfg.per_device_train_batch_size
                 b1 = min(b0 + cfg.per_device_train_batch_size, total_seqs)
 
-                loss, stats = compute_grpo_loss(
+                loss_sum, _, stats = compute_grpo_loss(
                     model,
                     input_ids[b0:b1],
                     attention_mask[b0:b1],
                     completion_mask[b0:b1],
                     advantages[b0:b1],
                 )
-                loss = loss / num_sub_batches
+                loss = loss_sum / global_valid_tokens
+                if ddp:
+                    loss = loss * ddp_world_size
                 loss.backward()
                 total_loss_sum += stats.pop("_loss_sum")
                 total_valid_tokens += stats.pop("_num_valid_tokens")
