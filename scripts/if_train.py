@@ -1396,15 +1396,9 @@ def main() -> None:
                     completion_mask[b0:b1],
                     advantages[b0:b1],
                 )
-                loss = loss_sum / global_valid_tokens
-                if ddp:
-                    loss = loss * ddp_world_size
+                loss = loss_sum / (global_valid_tokens * num_sub_batches * prompts_per_rank)
                 loss.backward()
                 total_loss_sum += stats.pop("_loss_sum")
-                total_valid_tokens += stats.pop("_num_valid_tokens")
-
-                for key, value in stats.items():
-                    all_stats[key] = all_stats.get(key, 0.0) + value / num_sub_batches
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
