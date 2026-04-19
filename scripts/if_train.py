@@ -521,8 +521,6 @@ for step in range(num_steps):
             ids_expanded.extend([ids] * args.num_generations)
             kwargs_expanded.extend([kws] * args.num_generations)
 
-        assert advantages.shape[0] == input_ids.shape[0], f"advantages {advantages.shape} vs input_ids {input_ids.shape}"
-        
         rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
         rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
 
@@ -546,6 +544,9 @@ for step in range(num_steps):
 
         input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
         input_ids = input_ids.to(device)
+
+        assert advantages.shape[0] == input_ids.shape[0], f"advantages {advantages.shape} vs input_ids {input_ids.shape}"
+
         attention_mask = attention_mask.to(device)
         completion_mask = completion_mask.to(device)
 
