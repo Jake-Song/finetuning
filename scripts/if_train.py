@@ -59,7 +59,7 @@ parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs 
 
 # Output
 parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
-parser.add_argument("--sample-output-jsonl", type=str, default=None, help="Relative or absolute JSONL path for logged training samples")
+parser.add_argument("--sample-output-jsonl", type=str, default="samples.jsonl", help="Relative or absolute JSONL path for logged training samples")
 parser.add_argument("--sample-log-every", type=int, default=None, help="Capture training samples every N steps (0 disables)")
 
 # Checkpointing
