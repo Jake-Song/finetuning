@@ -43,8 +43,9 @@ DATASET_CONFIG = "default"
 MAX_PROMPT_LENGTH = 512
 
 parser = argparse.ArgumentParser(description="IFEval GRPO training (native PyTorch)")
+parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
 parser.add_argument("--resume-from-checkpoint", type=str, default=None)
-parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
+parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 
 # Generation
 parser.add_argument("--temperature", type=float, default=0.7, help="sampling temperature")
@@ -59,17 +60,13 @@ parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs 
 
 # Output
 parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
-parser.add_argument("--sample-output-jsonl", type=str, default="samples.jsonl", help="Relative or absolute JSONL path for logged training samples")
-parser.add_argument("--sample-log-every", type=int, default=None, help="Capture training samples every N steps (0 disables)")
 
 # Checkpointing
 parser.add_argument("--output-dir", type=str, default="./ckpt_grpo_ifeval", help="output directory")
 parser.add_argument("--save-every", type=int, default=50, help="save every N steps")
-parser.add_argument("--log-every", type=int, default=1, help="log every N steps")
 parser.add_argument("--eval-steps", type=int, default=50, help="eval every N steps")
-parser.add_argument("--eval-size", type=int, default=200, help="eval size")
+parser.add_argument("--eval-size", type=int, default=50, help="eval size")
 parser.add_argument("--seed", type=int, default=42, help="random seed")
-parser.add_argument("--sample-prompts-per-capture", type=int, default=1, help="sample prompts per capture")
 
 # Optimization
 parser.add_argument("--lr-scheduler-type", type=str, default="linear", help="learning rate scheduler type")
@@ -90,9 +87,7 @@ parser.add_argument("--vllm-max-parallel-requests", type=int, default=8, help="v
 args = parser.parse_args()
 user_config = vars(args).copy()
 
-def load_ifeval_dataset(
-    eval_size: int = 100,
-) -> tuple[Dataset, Dataset | None]:
+def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 
@@ -116,6 +111,54 @@ def load_ifeval_dataset(
         splits = full.train_test_split(test_size=eval_size, seed=42)
         return splits["train"], splits["test"]
     return full, None
+
+
+def dry_run() -> None:
+    print("=" * 60)
+    print("IFEVAL GRPO NATIVE PYTORCH DRY RUN")
+    print("=" * 60)
+
+    print("\n[Config]")
+    print(f"  model:              {MODEL_ID}")
+    print(f"  dataset:            {DATASET_NAME} ({DATASET_CONFIG})")
+    print(f"  max_prompt_length:  {MAX_PROMPT_LENGTH}")
+    print(f"  num_generations:    {args.num_generations}")
+    print(f"  examples_per_step:  {args.examples_per_step}")
+    print(f"  device_batch_size:  {args.device_batch_size}")
+    print(f"  max_new_tokens:     {args.max_new_tokens}")
+    print(f"  learning_rate:      {args.learning_rate}")
+    print(f"  num_epochs:         {args.num_epochs}")
+    print(f"  output_dir:         {args.output_dir}")
+    print(f"  vllm_server:        {args.vllm_server_host}:{args.vllm_server_port}")
+    print(f"  hf_token:           {'set' if HF_TOKEN else 'not set'}")
+
+    print("\n[Dataset]")
+    train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size)
+    print(f"  train samples: {len(train_dataset)}")
+    print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
+
+    first = train_dataset[0]
+    instruction_ids = json.loads(first["instruction_id_list"])
+    kwargs = json.loads(first["kwargs"])
+    print(f"\n  First prompt preview: {first['prompt'][:150]}...")
+    print(f"  First instruction ids: {instruction_ids}")
+    print(f"  First kwargs: {kwargs}")
+
+    print("\n[Reward function test]")
+    test_completion = "This is a dry-run completion used to validate reward evaluation plumbing."
+    summary = summarize_constraint_evaluation(test_completion, instruction_ids, kwargs)
+    print(f"  reward:      {summary['reward']:.4f}")
+    print(f"  all_passed:  {summary['all_passed']}")
+
+    print("\n[Tokenizer]")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, token=HF_TOKEN)
+    print(f"  vocab_size:  {tokenizer.vocab_size}")
+    print(f"  pad_token:   {tokenizer.pad_token}")
+    print(f"  eos_token:   {tokenizer.eos_token}")
+
+    print(f"\n{'=' * 60}")
+    print("DRY RUN COMPLETE")
+    print("=" * 60)
 
 
 def generate_completions(
@@ -175,63 +218,6 @@ def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> No
         )
         f.write(f"| {step} | {timestamp} | {values} |\n")
 
-
-def resolve_sample_log_path(output_dir: str, sample_output_jsonl: str) -> str:
-    sample_output_jsonl = sample_output_jsonl.strip()
-    if not sample_output_jsonl:
-        return ""
-    if os.path.isabs(sample_output_jsonl):
-        return sample_output_jsonl
-    return os.path.join(output_dir, sample_output_jsonl)
-
-
-def append_training_samples_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def build_training_sample_rows(
-    *,
-    step: int,
-    prompts: list[str], 
-    instruction_ids_per_prompt: list[list[str]],
-    kwargs_per_prompt: list[list[dict]],
-    completions_text: list[str],
-    rewards: list[float],
-    num_generations: int,
-    sample_prompts_per_capture: int,
-) -> list[dict[str, Any]]:
-    rows = []
-    prompts_to_log = min(sample_prompts_per_capture, len(prompts))
-    for prompt_idx in range(prompts_to_log):
-        seq_start = prompt_idx * num_generations
-        seq_end = seq_start + num_generations
-        ids = instruction_ids_per_prompt[prompt_idx]
-        kws = kwargs_per_prompt[prompt_idx]
-        samples = []
-        for generation_index, (completion, reward) in enumerate(
-            zip(completions_text[seq_start:seq_end], rewards[seq_start:seq_end], strict=False)
-        ):
-            summary = summarize_constraint_evaluation(completion, ids, kws)
-            samples.append({
-                "generation_index": generation_index,
-                "completion": completion,
-                "reward": reward,
-                "all_passed": summary["all_passed"],
-                "constraint_results": summary["results"],
-            })
-        rows.append({
-            "step": step,
-            "prompt": prompts[prompt_idx],
-            "instruction_id_list": ids,
-            "kwargs": kws,
-            "num_generations": num_generations,
-            "samples": samples,
-        })
-    return rows
-
 def save_checkpoint(
     checkpoint_dir: str,
     raw_model,
@@ -263,7 +249,6 @@ def save_checkpoint(
 
 @torch.no_grad()
 def run_eval(
-    model,
     raw_model,
     rollout_client: OpenAICompatibleRolloutClient,
     tokenizer,
@@ -358,7 +343,10 @@ def run_eval(
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
     mean_reward = (reward_sum / count.clamp(min=1)).item()
-    variance = (reward_sq_sum / count.clamp(min=1)).item() - mean_reward * mean_reward
+    if count.item() > 1:
+        variance = ((reward_sq_sum - (reward_sum * reward_sum) / count) / (count - 1)).item()
+    else:
+        variance = 0.0
     std_reward = max(variance, 0.0) ** 0.5
 
     return {
@@ -369,6 +357,9 @@ def run_eval(
     }
 
 
+if args.dry_run:
+    dry_run()
+    raise SystemExit(0)
 
 device_type = autodetect_device_type()
 if device_type != "cuda":
@@ -465,18 +456,13 @@ print0(f"Calculated number of steps: {num_steps}")
 examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
-sample_log_path = resolve_sample_log_path(args.output_dir, args.sample_output_jsonl)
-if sample_log_path:
-    print0(f"Training samples JSONL: {sample_log_path} (every {args.sample_log_every} steps)")
-
 data_iter = iter(loader)
 
 for step in range(num_steps):
 
-    if step % args.eval_steps == 0:
+    if step > 0 and step % args.eval_steps == 0:
         model.eval()
         metrics = run_eval(
-            model,
             raw_model,
             rollout_client,
             tokenizer,
@@ -511,13 +497,10 @@ for step in range(num_steps):
 
         ids_expanded = []
         kwargs_expanded = []
-        ids_per_prompt = []
-        kwargs_per_prompt = []
+        
         for prompt_idx in range(len(prompts)):
             ids = json.loads(batch["instruction_id_list"][prompt_idx])
             kws = json.loads(batch["kwargs"][prompt_idx])
-            ids_per_prompt.append(ids)
-            kwargs_per_prompt.append(kws)
             ids_expanded.extend([ids] * args.num_generations)
             kwargs_expanded.extend([kws] * args.num_generations)
 
@@ -528,19 +511,6 @@ for step in range(num_steps):
         mu = rewards_grouped.mean(dim=1, keepdim=True)
         std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
         advantages = ((rewards_grouped - mu) / std).view(-1)
-
-        if sample_log_path:
-            sample_rows = build_training_sample_rows(
-                step=step,
-                prompts=prompts,
-                instruction_ids_per_prompt=ids_per_prompt,
-                kwargs_per_prompt=kwargs_per_prompt,
-                completions_text=completions_text,
-                rewards=rewards,
-                num_generations=args.num_generations,
-                sample_prompts_per_capture=args.sample_prompts_per_capture,
-            )
-            append_training_samples_jsonl(sample_log_path, sample_rows)
 
         input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
         input_ids = input_ids.to(device)
@@ -573,7 +543,7 @@ for step in range(num_steps):
             loss = -pg_obj
             loss.backward()
 
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f}")
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
             
         rewards_list.append(rewards_t.mean().item())
         sequence_lengths.extend(len(seq) for seq in completions_text)
@@ -599,8 +569,12 @@ for step in range(num_steps):
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
-    
-    if master_process and step % args.save_every == 0:
+    wandb_run.log({
+        "step": step,
+        "lrm": get_lr_lambda(step),
+        "lr": optimizer.param_groups[0]["lr"],
+    })
+    if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         ckpt_dir = os.path.join(args.output_dir, f"step_{step}")
         save_checkpoint(ckpt_dir, raw_model, tokenizer, optimizer, scheduler, step)
         print0(f"Saved checkpoint to {ckpt_dir}")
