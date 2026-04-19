@@ -415,7 +415,7 @@ rollout_client = OpenAICompatibleRolloutClient(
     max_parallel_requests=args.vllm_max_parallel_requests,
 )
 
-train_dataset, eval_dataset = load_ifeval_dataset(args, args.eval_size)
+train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size)
 print0(f"Train dataset: {len(train_dataset)} examples")
 if eval_dataset:
     print0(f"Eval dataset: {len(eval_dataset)} examples (every {args.eval_steps} steps)")
@@ -563,7 +563,7 @@ for step in range(num_steps):
             log_probs = F.log_softmax(logits, dim=-1)
             token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
-            pg_obj = (advantages[b0:b1].unsqueeze(-1) * token_log_probs).sum() 
+            pg_obj = (advantages[b0:b1].unsqueeze(-1) * token_log_probs * token_mask).sum() 
             num_valid = token_mask.sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
             
@@ -585,7 +585,7 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-        
+
     print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
     wandb_run.log({
         "step": step,
