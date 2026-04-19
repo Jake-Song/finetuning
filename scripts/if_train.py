@@ -516,11 +516,13 @@ for step in range(num_steps):
         for prompt_idx in range(len(prompts)):
             ids = json.loads(batch["instruction_id_list"][prompt_idx])
             kws = json.loads(batch["kwargs"][prompt_idx])
-        ids_per_prompt.append(ids)
-        kwargs_per_prompt.append(kws)
-        ids_expanded.extend([ids] * args.num_generations)
-        kwargs_expanded.extend([kws] * args.num_generations)
+            ids_per_prompt.append(ids)
+            kwargs_per_prompt.append(kws)
+            ids_expanded.extend([ids] * args.num_generations)
+            kwargs_expanded.extend([kws] * args.num_generations)
 
+        assert advantages.shape[0] == input_ids.shape[0], f"advantages {advantages.shape} vs input_ids {input_ids.shape}"
+        
         rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
         rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
 
