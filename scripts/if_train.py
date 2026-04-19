@@ -532,6 +532,7 @@ for step in range(num_steps):
             logits = logits[:, :-1, :]
             targets = input_ids[b0:b1, 1:]
             token_mask = completion_mask[b0:b1, 1:].float()
+            rewards = rewards_t[b0:b1]
 
             log_probs = F.log_softmax(logits, dim=-1)
             token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
@@ -543,7 +544,7 @@ for step in range(num_steps):
             loss = -pg_obj
             loss.backward()
 
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards_t.mean().item()}")
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
             
         rewards_list.append(rewards_t.mean().item())
         sequence_lengths.extend(len(seq) for seq in completions_text)
