@@ -124,31 +124,41 @@ class OpenAICompatibleRolloutClient:
     def generate_completions(
         self,
         tokenizer,
-        prompt: str,
+        prompt: str | list[str],
         *,
         max_new_tokens: int,
         temperature: float,
         top_p: float,
         num_generations: int,
-    ) -> tuple[list[int], list[int], list[str]]:
-        all_input_ids: list[int] = []
-        all_completion_masks: list[int] = []
+    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        if not prompts:
+            return [], [], []
+
+        all_input_ids: list[list[int]] = []
+        all_completion_masks: list[list[int]] = []
         all_texts: list[str] = []
 
-        max_workers = self.max_parallel_requests
+        max_workers = min(self.max_parallel_requests, len(prompts))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future = executor.submit(
-                self._generate_one,
-                tokenizer,
-                prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                num_generations=num_generations,
-            )
-            
-            all_input_ids, all_completion_masks, all_texts = future.result()
-               
+            futures = [
+                executor.submit(
+                    self._generate_one,
+                    tokenizer,
+                    prompt_text,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    num_generations=num_generations,
+                )
+                for prompt_text in prompts
+            ]
+
+            for future in futures:
+                input_ids, completion_masks, texts = future.result()
+                all_input_ids.extend(input_ids)
+                all_completion_masks.extend(completion_masks)
+                all_texts.extend(texts)
 
         return all_input_ids, all_completion_masks, all_texts
 

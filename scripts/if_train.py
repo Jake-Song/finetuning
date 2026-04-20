@@ -405,6 +405,9 @@ def get_batch():
         conversation = train_dataset[example_idx]
         prompt = conversation["prompt"]
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        
+        instruction_ids = json.loads(conversation["instruction_id_list"])
+        kwargs_list = json.loads(conversation["kwargs"])
 
         all_ids, all_masks, completions_text = generate_completions(
             rollout_client,
@@ -415,8 +418,13 @@ def get_batch():
             top_p=args.top_p,
             num_generations=args.num_generations,
         )
-        print("all_ids", all_ids)
-        max_len = max(len(s) for s in all_ids)
+
+        ids_expanded = [instruction_ids] * args.num_generations
+        kwargs_expanded = [kwargs_list] * args.num_generations
+        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
+        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
+
+        max_len = max(len(seq) for seq in all_ids)
         input_ids = []
         attention_masks = []
         completion_masks = []
@@ -433,15 +441,6 @@ def get_batch():
         inputs = ids[:, :-1]
         targets = ids[:, 1:].clone() # clone to avoid in-place modification
         targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
-
-        ids_expanded = []
-        kwargs_expanded = []
-        for ids, kws in zip(conversation.get("instruction_id_list", []), conversation.get("kwargs", [])):
-            ids_expanded.extend([ids] * args.num_generations)
-            kwargs_expanded.extend([kws] * args.num_generations)
-
-        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
 
         mu = rewards.mean()
         std = rewards.std().clamp(min=1e-8)
