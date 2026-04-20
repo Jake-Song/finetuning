@@ -426,7 +426,7 @@ def get_batch():
             attention_masks.append([1] * len(seq) + [0] * pad_len)
             completion_masks.append(mask + [0] * pad_len)
 
-        ids = torch.tensor(input_ids, dtype=torch.long, device=device),
+        ids = torch.tensor(input_ids, dtype=torch.long, device=device)
         attention_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
         completion_masks = torch.tensor(completion_masks, dtype=torch.long, device=device)
 
