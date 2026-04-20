@@ -580,40 +580,46 @@ for step in range(num_steps):
         rewards_grouped = rewards_t.view(-1, args.num_generations)
         mu = rewards_grouped.mean(dim=1, keepdim=True)
         std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
-        advantages = ((rewards_grouped - mu) / std).view(-1)
+        advantages_all = (rewards_grouped - mu) / std
 
         input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+        
         input_ids = input_ids.to(device)
-
-        assert advantages.shape[0] == input_ids.shape[0], f"advantages {advantages.shape} vs input_ids {input_ids.shape}"
-
         attention_mask = attention_mask.to(device)
         completion_mask = completion_mask.to(device)
 
+        inputs_all = input_ids[:, :-1]
+        targets_all = input_ids[:, 1:].clone() # clone to avoid in-place modification
+        targets_all[completion_mask[:, 1:] == 0] = -1 # -1 is the ignore index
+
         total_seqs = input_ids.shape[0]
-        num_passes = math.ceil(total_seqs / args.device_batch_size)
+        assert total_seqs % args.device_batch_size == 0
+        num_passes = total_seqs // args.device_batch_size
 
         model.train()
         for pass_idx in range(num_passes):
             b0 = pass_idx * args.device_batch_size
             b1 = min(b0 + args.device_batch_size, total_seqs)
 
-            logits = model(input_ids=input_ids[b0:b1], attention_mask=attention_mask[b0:b1]).logits
-            logits = logits[:, :-1, :]
-            targets = input_ids[b0:b1, 1:]
+            logits = model(input_ids=inputs_all[b0:b1], attention_mask=attention_mask[b0:b1, :-1]).logits
+            targets = targets_all[b0:b1]
             token_mask = completion_mask[b0:b1, 1:].float()
             rewards = rewards_t[b0:b1]
-
-            log_probs = F.log_softmax(logits, dim=-1)
-            token_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-
-            pg_obj = (advantages[b0:b1].unsqueeze(-1) * token_log_probs * token_mask).sum() 
-            num_valid = token_mask.sum().clamp(min=1)
+            
+            advantages = advantages_all[b0:b1]
+            log_probs = -F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+                ignore_index=-1,
+            ).view_as(targets)
+      
+            pg_obj = (log_probs * advantages.unsqueeze(-1)).sum() 
+            num_valid = (targets >= 0).sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
             
             loss = -pg_obj
             loss.backward()
-
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
             
         rewards_list.append(rewards_t.mean().item())
