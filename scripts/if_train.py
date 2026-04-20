@@ -24,7 +24,6 @@ import torch.nn.functional as F
 import wandb
 from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
-from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.common import DummyWandb, autodetect_device_type, compute_init, print0, compute_cleanup
@@ -194,6 +193,44 @@ def save_checkpoint(
 
 
 @torch.no_grad()
+def iter_eval_records(
+    rollout_client: OpenAICompatibleRolloutClient,
+    tokenizer,
+    eval_dataset: Dataset,
+    ddp_world_size: int,
+    ddp_rank: int,
+):
+    for idx in range(ddp_rank, len(eval_dataset), ddp_world_size):
+        example = eval_dataset[idx]
+        prompt = example["prompt"]
+        instruction_ids = json.loads(example["instruction_id_list"])
+        kwargs_list = json.loads(example["kwargs"])
+
+        _, _, completions = generate_completions(
+            rollout_client,
+            tokenizer,
+            prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            num_generations=args.num_generations,
+        )
+
+        outcomes = []
+        for completion in completions:
+            summary = summarize_constraint_evaluation(completion, instruction_ids, kwargs_list)
+            outcomes.append({
+                "reward": summary["reward"],
+                "all_passed": summary["all_passed"],
+            })
+
+        yield {
+            "idx": idx,
+            "outcomes": outcomes,
+        }
+
+
+@torch.no_grad()
 def run_eval(
     raw_model,
     rollout_client: OpenAICompatibleRolloutClient,
@@ -220,63 +257,28 @@ def run_eval(
     if ddp:
         dist.barrier()
 
-    assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
-    examples_per_rank = args.examples_per_step // ddp_world_size
-
-    sampler = (
-        DistributedSampler(
-            eval_dataset,
-            num_replicas=ddp_world_size,
-            rank=ddp_rank,
-            shuffle=False,
-            drop_last=False,
-        )
-        if ddp
-        else None
-    )
-    loader = DataLoader(
-        eval_dataset,
-        batch_size=examples_per_rank,
-        sampler=sampler,
-        shuffle=False,
-        drop_last=False,
-    )
-
     reward_sum = torch.zeros(1, dtype=torch.float64, device=device)
     reward_sq_sum = torch.zeros(1, dtype=torch.float64, device=device)
     full_constraint_sum = torch.zeros(1, dtype=torch.float64, device=device)
     count = torch.zeros(1, dtype=torch.float64, device=device)
 
-    for batch in loader:
-        prompts = list(batch["prompt"])
-        ids_per_prompt = [json.loads(item) for item in batch["instruction_id_list"]]
-        kwargs_per_prompt = [json.loads(item) for item in batch["kwargs"]]
-
-        _, _, completions = generate_completions(
-            rollout_client,
-            tokenizer,
-            prompts,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            num_generations=args.num_generations,
+    for record in iter_eval_records(
+        rollout_client,
+        tokenizer,
+        eval_dataset,
+        ddp_world_size,
+        ddp_rank,
+    ):
+        reward_tensor = torch.tensor(
+            [outcome["reward"] for outcome in record["outcomes"]],
+            dtype=torch.float64,
+            device=device,
         )
-
-        ids_expanded = []
-        kwargs_expanded = []
-        for ids, kws in zip(ids_per_prompt, kwargs_per_prompt):
-            ids_expanded.extend([ids] * args.num_generations)
-            kwargs_expanded.extend([kws] * args.num_generations)
-
-        summaries = [
-            summarize_constraint_evaluation(completion, ids, kws)
-            for completion, ids, kws in zip(completions, ids_expanded, kwargs_expanded)
-        ]
-        rewards = [summary["reward"] for summary in summaries]
-        full_constraint = [float(summary["all_passed"]) for summary in summaries]
-
-        reward_tensor = torch.tensor(rewards, dtype=torch.float64, device=device)
-        full_constraint_tensor = torch.tensor(full_constraint, dtype=torch.float64, device=device)
+        full_constraint_tensor = torch.tensor(
+            [float(outcome["all_passed"]) for outcome in record["outcomes"]],
+            dtype=torch.float64,
+            device=device,
+        )
 
         reward_sum += reward_tensor.sum()
         reward_sq_sum += (reward_tensor * reward_tensor).sum()
