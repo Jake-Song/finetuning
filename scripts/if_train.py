@@ -505,7 +505,8 @@ sample_output_jsonl_path = resolve_sample_output_jsonl_path(
 )
 
 for step in range(num_steps):
-
+    optimizer.zero_grad(set_to_none=True)
+    
     if step > 0 and step % args.eval_steps == 0:
         model.eval()
         metrics = run_eval(
@@ -595,8 +596,6 @@ for step in range(num_steps):
         total_seqs = input_ids.shape[0]
         assert total_seqs % args.device_batch_size == 0
         num_passes = total_seqs // args.device_batch_size
-
-        optimizer.zero_grad(set_to_none=True)
 
         model.train()
         for pass_idx in range(num_passes):
