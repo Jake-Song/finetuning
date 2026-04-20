@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.common import DummyWandb, autodetect_device_type, compute_init, print0, compute_cleanup
 from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model_weights
-from tasks.IF_EVAL import compute_rewards, summarize_constraint_evaluation
+from tasks.IF_EVAL import summarize_constraint_evaluation
 
 load_dotenv()
 
@@ -111,26 +111,6 @@ def generate_completions(
         num_generations=num_generations,
     )
 
-
-def pad_and_stack(
-    sequences: list[list[int]],
-    masks: list[list[int]],
-    pad_id: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    max_len = max(len(s) for s in sequences)
-    input_ids = []
-    attention_masks = []
-    completion_masks = []
-    for seq, mask in zip(sequences, masks):
-        pad_len = max_len - len(seq)
-        input_ids.append(seq + [pad_id] * pad_len)
-        attention_masks.append([1] * len(seq) + [0] * pad_len)
-        completion_masks.append(mask + [0] * pad_len)
-    return (
-        torch.tensor(input_ids, dtype=torch.long),
-        torch.tensor(attention_masks, dtype=torch.long),
-        torch.tensor(completion_masks, dtype=torch.long),
-    )
 
 def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> None:
     os.makedirs(output_dir, exist_ok=True)
@@ -419,10 +399,15 @@ def get_batch():
             num_generations=args.num_generations,
         )
 
-        ids_expanded = [instruction_ids] * args.num_generations
-        kwargs_expanded = [kwargs_list] * args.num_generations
-        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
+        summaries = [
+            summarize_constraint_evaluation(completion, instruction_ids, kwargs_list)
+            for completion in completions_text
+        ]
+        rewards = torch.tensor(
+            [summary["reward"] for summary in summaries],
+            dtype=torch.float,
+            device=device,
+        )
 
         max_len = max(len(seq) for seq in all_ids)
         input_ids = []
@@ -446,30 +431,22 @@ def get_batch():
         std = rewards.std().clamp(min=1e-8)
         advantages = (rewards - mu) / std
         
-        yield completions_text, inputs, targets, attention_masks, rewards, advantages
+        yield (
+            prompt,
+            instruction_ids,
+            kwargs_list,
+            summaries,
+            completions_text,
+            inputs,
+            targets,
+            attention_masks,
+            rewards,
+            advantages,
+        )
 
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
 examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
-
-# sampler = (
-#     DistributedSampler(
-#         train_dataset,
-#         num_replicas=ddp_world_size,
-#         rank=ddp_rank,
-#         shuffle=True,
-#         drop_last=True,
-#     )
-#     if ddp
-#     else None
-# )
-# loader = DataLoader(
-#     train_dataset,
-#     batch_size=examples_per_rank,
-#     sampler=sampler,
-#     shuffle=(sampler is None),
-#     drop_last=True,
-# )
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
@@ -539,75 +516,19 @@ for step in range(num_steps):
     rewards_list = []
     sequence_lengths = []
     for example_step in range(examples_per_rank):   
-        # batch = next(data_iter)
-        completions_text, inputs_all, targets_all, attention_masks, rewards_all, advantages_all = next(batch_iterator)
+        (
+            prompt,
+            instruction_ids,
+            kwargs_list,
+            summaries,
+            completions_text,
+            inputs_all,
+            targets_all,
+            attention_masks,
+            rewards_all,
+            advantages_all,
+        ) = next(batch_iterator)
         
-        # prompts = list(batch["prompt"])
-        # pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        
-        # rewards_list = []
-        # sequence_lengths = []
-        # all_ids, all_masks, completions_text = generate_completions(
-        #     rollout_client,
-        #     tokenizer,
-        #     prompts,
-        #     max_new_tokens=args.max_new_tokens,
-        #     temperature=args.temperature,
-        #     top_p=args.top_p,
-        #     num_generations=args.num_generations,
-        # )
-
-        # ids_expanded = []
-        # kwargs_expanded = []
-        # for prompt_idx in range(len(prompts)):
-        #     ids = json.loads(batch["instruction_id_list"][prompt_idx])
-        #     kws = json.loads(batch["kwargs"][prompt_idx])
-        #     ids_expanded.extend([ids] * args.num_generations)
-        #     kwargs_expanded.extend([kws] * args.num_generations)
-
-        # rewards_all = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
-        # rewards_all = torch.tensor(rewards_all, dtype=torch.float, device=device)
-
-        # sample_rows = []
-        # for sample_idx, completion in enumerate(completions_text):
-        #     prompt_idx = sample_idx // args.num_generations
-        #     generation_idx = sample_idx % args.num_generations
-        #     summary = summarize_constraint_evaluation(
-        #         completion,
-        #         ids_expanded[sample_idx],
-        #         kwargs_expanded[sample_idx],
-        #     )
-        #     sample_rows.append({
-        #         "step": step,
-        #         "example_step": example_step,
-        #         "prompt_index": prompt_idx,
-        #         "generation_index": generation_idx,
-        #         "prompt": prompts[prompt_idx],
-        #         "instruction_id_list": ids_expanded[sample_idx],
-        #         "kwargs": kwargs_expanded[sample_idx],
-        #         "completion": completion,
-        #         "reward": summary["reward"],
-        #         "all_passed": summary["all_passed"],
-        #         "constraint_results": summary["results"],
-        #     })
-        # append_sample_rows(sample_output_jsonl_path, sample_rows)
-
-        # mu = rewards_all.mean()
-        # std = rewards_all.std().clamp(min=1e-8)
-        # advantages_all = (rewards_all - mu) / std
-
-        # input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
-        
-        # input_ids = input_ids.to(device)
-        # attention_mask = attention_mask.to(device)
-        # completion_mask = completion_mask.to(device)
-
-        # inputs_all = input_ids[:, :-1]
-        # targets_all = input_ids[:, 1:].clone() # clone to avoid in-place modification
-        # targets_all[completion_mask[:, 1:] == 0] = -1 # -1 is the ignore index
-
-
-
         total_seqs = inputs_all.shape[0]
         assert total_seqs % args.device_batch_size == 0
         num_passes = total_seqs // args.device_batch_size
@@ -638,6 +559,27 @@ for step in range(num_steps):
             loss = -pg_obj
             loss.backward()
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
+
+            sample_rows = []
+            for local_idx, completion in enumerate(completions_text[b0:b1]):
+                generation_idx = b0 + local_idx
+                summary = summaries[generation_idx]
+                sample_rows.append({
+                    "step": step,
+                    "example_step": example_step,
+                    "pass_idx": pass_idx,
+                    "pass_sample_index": local_idx,
+                    "generation_index": generation_idx,
+                    "prompt": prompt,
+                    "instruction_id_list": instruction_ids,
+                    "kwargs": kwargs_list,
+                    "completion": completion,
+                    "reward": rewards[local_idx].item(),
+                    "advantage": advantages[local_idx].item(),
+                    "all_passed": summary["all_passed"],
+                    "constraint_results": summary["results"],
+                })
+            append_sample_rows(sample_output_jsonl_path, sample_rows)
             
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in completions_text)
