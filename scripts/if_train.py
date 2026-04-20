@@ -92,32 +92,6 @@ parser.add_argument("--vllm-max-parallel-requests", type=int, default=8, help="v
 args = parser.parse_args()
 user_config = vars(args).copy()
 
-def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
-    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
-
-    rows = []
-    for example in ds:
-        prompt_text = (example.get("prompt") or "").strip()
-        if not prompt_text:
-            raise ValueError(f"No usable rows found in dataset {DATASET_NAME}/{DATASET_CONFIG}. Expected prompt field.")
-
-        tokens = tokenizer.encode(prompt_text, truncation=True, max_length=MAX_PROMPT_LENGTH)
-        prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
-
-        rows.append({
-            "prompt": prompt_text,
-            "instruction_id_list": json.dumps(example.get("instruction_id_list") or []),
-            "kwargs": json.dumps(example.get("kwargs") or []),
-        })
-
-    full = Dataset.from_list(rows)
-    if eval_size > 0 and eval_size < len(full):
-        splits = full.train_test_split(test_size=eval_size, seed=42)
-        return splits["train"], splits["test"]
-    return full, None
-
-
 def generate_completions(
     rollout_client: OpenAICompatibleRolloutClient,
     tokenizer,
@@ -392,33 +366,111 @@ rollout_client = OpenAICompatibleRolloutClient(
     max_parallel_requests=args.vllm_max_parallel_requests,
 )
 
+def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
+    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
+
+    rows = []
+    for example in ds:
+        prompt_text = (example.get("prompt") or "").strip()
+        if not prompt_text:
+            raise ValueError(f"No usable rows found in dataset {DATASET_NAME}/{DATASET_CONFIG}. Expected prompt field.")
+
+        tokens = tokenizer.encode(prompt_text, truncation=True, max_length=MAX_PROMPT_LENGTH)
+        prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
+
+        rows.append({
+            "prompt": prompt_text,
+            "instruction_id_list": json.dumps(example.get("instruction_id_list") or []),
+            "kwargs": json.dumps(example.get("kwargs") or []),
+        })
+
+    full = Dataset.from_list(rows)
+    if eval_size > 0 and eval_size < len(full):
+        splits = full.train_test_split(test_size=eval_size, seed=42)
+        return splits["train"], splits["test"]
+    return full, None
+
 train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size)
 print0(f"Train dataset: {len(train_dataset)} examples")
 if eval_dataset:
     print0(f"Eval dataset: {len(eval_dataset)} examples (every {args.eval_steps} steps)")
 
+import itertools
+
+@torch.no_grad()
+def get_batch():
+    rank_indices = range(ddp_rank, len(train_dataset), ddp_world_size) # each rank is responsible for different examples in the training data
+    for example_idx in itertools.cycle(rank_indices):
+        conversation = train_dataset[example_idx]
+        prompt = conversation["prompt"]
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+        all_ids, all_masks, completions_text = generate_completions(
+            rollout_client,
+            tokenizer,
+            [prompt],
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            num_generations=args.num_generations,
+        )
+
+        max_len = max(len(s) for s in all_ids)
+        input_ids = []
+        attention_masks = []
+        completion_masks = []
+        for seq, mask in zip(all_ids, all_masks):
+            pad_len = max_len - len(seq)
+            input_ids.append(seq + [pad_id] * pad_len)
+            attention_masks.append([1] * len(seq) + [0] * pad_len)
+            completion_masks.append(mask + [0] * pad_len)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=device),
+        attention_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
+        completion_masks = torch.tensor(completion_masks, dtype=torch.long, device=device)
+
+        input_ids = input_ids[:, :-1]
+        targets = input_ids[:, 1:].clone() # clone to avoid in-place modification
+        targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
+
+        ids_expanded = []
+        kwargs_expanded = []
+        for ids, kws in zip(conversation.get("instruction_id_list", []), conversation.get("kwargs", [])):
+            ids_expanded.extend([ids] * args.num_generations)
+            kwargs_expanded.extend([kws] * args.num_generations)
+
+        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
+        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
+
+        mu = rewards.mean()
+        std = rewards.std().clamp(min=1e-8)
+        advantages = (rewards - mu) / std
+        
+        yield completions_text, input_ids, targets, attention_masks, rewards, advantages
+
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
 examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
-sampler = (
-    DistributedSampler(
-        train_dataset,
-        num_replicas=ddp_world_size,
-        rank=ddp_rank,
-        shuffle=True,
-        drop_last=True,
-    )
-    if ddp
-    else None
-)
-loader = DataLoader(
-    train_dataset,
-    batch_size=examples_per_rank,
-    sampler=sampler,
-    shuffle=(sampler is None),
-    drop_last=True,
-)
+# sampler = (
+#     DistributedSampler(
+#         train_dataset,
+#         num_replicas=ddp_world_size,
+#         rank=ddp_rank,
+#         shuffle=True,
+#         drop_last=True,
+#     )
+#     if ddp
+#     else None
+# )
+# loader = DataLoader(
+#     train_dataset,
+#     batch_size=examples_per_rank,
+#     sampler=sampler,
+#     shuffle=(sampler is None),
+#     drop_last=True,
+# )
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
@@ -443,7 +495,7 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
 num_steps = (len(train_dataset) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 
-data_iter = iter(loader)
+# data_iter = iter(loader)
 sample_output_jsonl_path = resolve_sample_output_jsonl_path(
     args.sample_output_jsonl,
     args.output_dir,
@@ -451,6 +503,8 @@ sample_output_jsonl_path = resolve_sample_output_jsonl_path(
     ddp_world_size,
 )
 
+
+batch_iterator = get_batch()
 for step in range(num_steps):
        
     sync_server_model_weights(
@@ -483,74 +537,79 @@ for step in range(num_steps):
             wandb_run.log({"step": step, **metrics})
             append_eval_log(args.output_dir, step, metrics)
 
+    rewards_list = []
+    sequence_lengths = []
     for example_step in range(examples_per_rank):   
-        batch = next(data_iter)
-
-        prompts = list(batch["prompt"])
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        # batch = next(data_iter)
+        completions_text, inputs_all, targets_all, attention_masks, rewards_all, advantages_all = next(batch_iterator)
         
-        rewards_list = []
-        sequence_lengths = []
-        all_ids, all_masks, completions_text = generate_completions(
-            rollout_client,
-            tokenizer,
-            prompts,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            num_generations=args.num_generations,
-        )
-
-        ids_expanded = []
-        kwargs_expanded = []
-        for prompt_idx in range(len(prompts)):
-            ids = json.loads(batch["instruction_id_list"][prompt_idx])
-            kws = json.loads(batch["kwargs"][prompt_idx])
-            ids_expanded.extend([ids] * args.num_generations)
-            kwargs_expanded.extend([kws] * args.num_generations)
-
-        rewards_all = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
-        rewards_all = torch.tensor(rewards_all, dtype=torch.float, device=device)
-
-        sample_rows = []
-        for sample_idx, completion in enumerate(completions_text):
-            prompt_idx = sample_idx // args.num_generations
-            generation_idx = sample_idx % args.num_generations
-            summary = summarize_constraint_evaluation(
-                completion,
-                ids_expanded[sample_idx],
-                kwargs_expanded[sample_idx],
-            )
-            sample_rows.append({
-                "step": step,
-                "example_step": example_step,
-                "prompt_index": prompt_idx,
-                "generation_index": generation_idx,
-                "prompt": prompts[prompt_idx],
-                "instruction_id_list": ids_expanded[sample_idx],
-                "kwargs": kwargs_expanded[sample_idx],
-                "completion": completion,
-                "reward": summary["reward"],
-                "all_passed": summary["all_passed"],
-                "constraint_results": summary["results"],
-            })
-        append_sample_rows(sample_output_jsonl_path, sample_rows)
-
-        mu = rewards_all.mean()
-        std = rewards_all.std().clamp(min=1e-8)
-        advantages_all = (rewards_all - mu) / std
-
-        input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+        # prompts = list(batch["prompt"])
+        # pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        completion_mask = completion_mask.to(device)
+        # rewards_list = []
+        # sequence_lengths = []
+        # all_ids, all_masks, completions_text = generate_completions(
+        #     rollout_client,
+        #     tokenizer,
+        #     prompts,
+        #     max_new_tokens=args.max_new_tokens,
+        #     temperature=args.temperature,
+        #     top_p=args.top_p,
+        #     num_generations=args.num_generations,
+        # )
 
-        inputs_all = input_ids[:, :-1]
-        targets_all = input_ids[:, 1:].clone() # clone to avoid in-place modification
-        targets_all[completion_mask[:, 1:] == 0] = -1 # -1 is the ignore index
+        # ids_expanded = []
+        # kwargs_expanded = []
+        # for prompt_idx in range(len(prompts)):
+        #     ids = json.loads(batch["instruction_id_list"][prompt_idx])
+        #     kws = json.loads(batch["kwargs"][prompt_idx])
+        #     ids_expanded.extend([ids] * args.num_generations)
+        #     kwargs_expanded.extend([kws] * args.num_generations)
 
-        total_seqs = input_ids.shape[0]
+        # rewards_all = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
+        # rewards_all = torch.tensor(rewards_all, dtype=torch.float, device=device)
+
+        # sample_rows = []
+        # for sample_idx, completion in enumerate(completions_text):
+        #     prompt_idx = sample_idx // args.num_generations
+        #     generation_idx = sample_idx % args.num_generations
+        #     summary = summarize_constraint_evaluation(
+        #         completion,
+        #         ids_expanded[sample_idx],
+        #         kwargs_expanded[sample_idx],
+        #     )
+        #     sample_rows.append({
+        #         "step": step,
+        #         "example_step": example_step,
+        #         "prompt_index": prompt_idx,
+        #         "generation_index": generation_idx,
+        #         "prompt": prompts[prompt_idx],
+        #         "instruction_id_list": ids_expanded[sample_idx],
+        #         "kwargs": kwargs_expanded[sample_idx],
+        #         "completion": completion,
+        #         "reward": summary["reward"],
+        #         "all_passed": summary["all_passed"],
+        #         "constraint_results": summary["results"],
+        #     })
+        # append_sample_rows(sample_output_jsonl_path, sample_rows)
+
+        # mu = rewards_all.mean()
+        # std = rewards_all.std().clamp(min=1e-8)
+        # advantages_all = (rewards_all - mu) / std
+
+        # input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
+        
+        # input_ids = input_ids.to(device)
+        # attention_mask = attention_mask.to(device)
+        # completion_mask = completion_mask.to(device)
+
+        # inputs_all = input_ids[:, :-1]
+        # targets_all = input_ids[:, 1:].clone() # clone to avoid in-place modification
+        # targets_all[completion_mask[:, 1:] == 0] = -1 # -1 is the ignore index
+
+
+
+        total_seqs = inputs_all.size[0]
         assert total_seqs % args.device_batch_size == 0
         num_passes = total_seqs // args.device_batch_size
 
@@ -558,13 +617,14 @@ for step in range(num_steps):
         for pass_idx in range(num_passes):
             b0 = pass_idx * args.device_batch_size
             b1 = min(b0 + args.device_batch_size, total_seqs)
-
-            logits = model(input_ids=inputs_all[b0:b1], attention_mask=attention_mask[b0:b1, :-1]).logits
-            targets = targets_all[b0:b1]
-            token_mask = completion_mask[b0:b1, 1:].float()
-            rewards = rewards_all[b0:b1]
             
+            inputs = inputs_all[b0:b1]
+            targets = targets_all[b0:b1]
+            rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
+            attention_mask = attention_masks[b0:b1, :-1]
+
+            logits = model(input_ids=inputs, attention_mask=attention_mask).logits
             log_probs = -F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
