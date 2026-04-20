@@ -390,58 +390,58 @@ if eval_dataset:
 
 import itertools
 
-@torch.no_grad()
 def get_batch():
     rank_indices = range(ddp_rank, len(train_dataset), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
-        conversation = train_dataset[example_idx]
-        prompt = conversation["prompt"]
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        
-        instruction_ids = json.loads(conversation["instruction_id_list"])
-        kwargs_list = json.loads(conversation["kwargs"])
+        with torch.no_grad():
+            conversation = train_dataset[example_idx]
+            prompt = conversation["prompt"]
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            
+            instruction_ids = json.loads(conversation["instruction_id_list"])
+            kwargs_list = json.loads(conversation["kwargs"])
 
-        all_ids, all_masks, completions_text = generate_completions(
-            rollout_client,
-            tokenizer,
-            prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            num_generations=args.num_generations,
-        )
+            all_ids, all_masks, completions_text = generate_completions(
+                rollout_client,
+                tokenizer,
+                prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                num_generations=args.num_generations,
+            )
 
-        summaries = [
-            summarize_constraint_evaluation(completion, instruction_ids, kwargs_list)
-            for completion in completions_text
-        ]
-        rewards = torch.tensor(
-            [summary["reward"] for summary in summaries],
-            dtype=torch.float,
-            device=device,
-        )
+            summaries = [
+                summarize_constraint_evaluation(completion, instruction_ids, kwargs_list)
+                for completion in completions_text
+            ]
+            rewards = torch.tensor(
+                [summary["reward"] for summary in summaries],
+                dtype=torch.float,
+                device=device,
+            )
 
-        max_len = max(len(seq) for seq in all_ids)
-        input_ids = []
-        attention_masks = []
-        completion_masks = []
-        for seq, mask in zip(all_ids, all_masks):
-            pad_len = max_len - len(seq)
-            input_ids.append(seq + [pad_id] * pad_len)
-            attention_masks.append([1] * len(seq) + [0] * pad_len)
-            completion_masks.append(mask + [0] * pad_len)
+            max_len = max(len(seq) for seq in all_ids)
+            input_ids = []
+            attention_masks = []
+            completion_masks = []
+            for seq, mask in zip(all_ids, all_masks):
+                pad_len = max_len - len(seq)
+                input_ids.append(seq + [pad_id] * pad_len)
+                attention_masks.append([1] * len(seq) + [0] * pad_len)
+                completion_masks.append(mask + [0] * pad_len)
 
-        ids = torch.tensor(input_ids, dtype=torch.long, device=device)
-        attention_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
-        completion_masks = torch.tensor(completion_masks, dtype=torch.long, device=device)
+            ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+            attention_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
+            completion_masks = torch.tensor(completion_masks, dtype=torch.long, device=device)
 
-        inputs = ids[:, :-1]
-        targets = ids[:, 1:].clone() # clone to avoid in-place modification
-        targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
+            inputs = ids[:, :-1]
+            targets = ids[:, 1:].clone() # clone to avoid in-place modification
+            targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
 
-        mu = rewards.mean()
-        std = rewards.std().clamp(min=1e-8)
-        advantages = (rewards - mu) / std
+            mu = rewards.mean()
+            std = rewards.std().clamp(min=1e-8)
+            advantages = (rewards - mu) / std
         
         yield (
             prompt,

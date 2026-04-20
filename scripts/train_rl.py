@@ -70,66 +70,65 @@ val_task   = full_task[full_task_size - val_size:]
 num_steps = (train_task.num_examples() // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 
-@torch.no_grad()
 def get_batch():
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
+        with torch.no_grad():
+            # First get the full conversation of both user and assistant messages
+            conversation = train_task[example_idx]
 
-        # First get the full conversation of both user and assistant messages
-        conversation = train_task[example_idx]
+            # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
+            # (i.e. keep the <|assistant_start|>, but delete everything after it)
+            tokens = tokenizer.render_for_completion(conversation)
+            prefix_length = len(tokens)
 
-        # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
-        # (i.e. keep the <|assistant_start|>, but delete everything after it)
-        tokens = tokenizer.render_for_completion(conversation)
-        prefix_length = len(tokens)
+            # Generate num_samples samples using batched generation, use loop to avoid OOMs
+            model.eval() # ensure the model is in eval mode
+            generated_token_sequences = []
+            masks = []
+            num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
+            for sampling_step in range(num_sampling_steps):
+                seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
+                generated_token_sequences_batch, masks_batch = engine.generate_batch(
+                    tokens,
+                    num_samples=args.device_batch_size,
+                    max_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    seed=seed, # must make sure to change the seed for each sampling step
+                )
+                generated_token_sequences.extend(generated_token_sequences_batch)
+                masks.extend(masks_batch)
 
-        # Generate num_samples samples using batched generation, use loop to avoid OOMs
-        model.eval() # ensure the model is in eval mode
-        generated_token_sequences = []
-        masks = []
-        num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
-        for sampling_step in range(num_sampling_steps):
-            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
-            generated_token_sequences_batch, masks_batch = engine.generate_batch(
-                tokens,
-                num_samples=args.device_batch_size,
-                max_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                seed=seed, # must make sure to change the seed for each sampling step
-            )
-            generated_token_sequences.extend(generated_token_sequences_batch)
-            masks.extend(masks_batch)
+            # Calculate the rewards for each sample
+            rewards = []
+            for sample_tokens in generated_token_sequences:
+                # Get just the generated tokens (after the prompt)
+                generated_tokens = sample_tokens[prefix_length:]
+                # Decode the generated response
+                generated_text = tokenizer.decode(generated_tokens)
+                # Calculate the reward
+                reward = train_task.reward(conversation, generated_text)
+                rewards.append(reward)
 
-        # Calculate the rewards for each sample
-        rewards = []
-        for sample_tokens in generated_token_sequences:
-            # Get just the generated tokens (after the prompt)
-            generated_tokens = sample_tokens[prefix_length:]
-            # Decode the generated response
-            generated_text = tokenizer.decode(generated_tokens)
-            # Calculate the reward
-            reward = train_task.reward(conversation, generated_text)
-            rewards.append(reward)
-
-        # Pad the sequences so that their lengths (in time) match
-        max_length = max(len(seq) for seq in generated_token_sequences)
-        padded_generated_token_sequences = [seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
-        padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
-        # Stack up the sequences and masks into PyTorch tensors
-        ids = torch.tensor(padded_generated_token_sequences, dtype=torch.long, device=device)
-        mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)
-        # Generate autoregressive inputs and targets to the Transformer
-        inputs = ids[:, :-1]
-        targets = ids[:, 1:].clone() # clone to avoid in-place modification:
-        targets[mask_ids[:, 1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index
-        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
-        # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
-        mu = rewards.mean()
-        advantages = rewards - mu
+            # Pad the sequences so that their lengths (in time) match
+            max_length = max(len(seq) for seq in generated_token_sequences)
+            padded_generated_token_sequences = [seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
+            padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
+            # Stack up the sequences and masks into PyTorch tensors
+            ids = torch.tensor(padded_generated_token_sequences, dtype=torch.long, device=device)
+            mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)
+            # Generate autoregressive inputs and targets to the Transformer
+            inputs = ids[:, :-1]
+            targets = ids[:, 1:].clone() # clone to avoid in-place modification:
+            targets[mask_ids[:, 1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index
+            # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
+            # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
+            rewards = torch.tensor(rewards, dtype=torch.float, device=device)
+            # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
+            mu = rewards.mean()
+            advantages = rewards - mu
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
