@@ -314,7 +314,8 @@ def run_eval(
     if ddp:
         dist.barrier()
 
-    examples_per_rank = args.device_batch_size // ddp_world_size
+    assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
+    examples_per_rank = args.examples_per_step // ddp_world_size
 
     sampler = (
         DistributedSampler(
@@ -451,6 +452,7 @@ print0(f"Train dataset: {len(train_dataset)} examples")
 if eval_dataset:
     print0(f"Eval dataset: {len(eval_dataset)} examples (every {args.eval_steps} steps)")
 
+assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
 examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
