@@ -416,8 +416,6 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="grpo-ifeval
 
 print0(f"Loading tokenizer from {MODEL_ID}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, token=HF_TOKEN)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
 
 print0(f"Loading training model: {MODEL_ID}...")
 model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -525,14 +523,16 @@ for step in range(num_steps):
             wandb_run.log({"step": step, **metrics})
             append_eval_log(args.output_dir, step, metrics)
 
-    batch = next(data_iter)
-
-    prompts = list(batch["prompt"])
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     
-    rewards_list = []
-    sequence_lengths = []
     for example_step in range(examples_per_rank):   
+        batch = next(data_iter)
+
+        prompts = list(batch["prompt"])
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        
+        rewards_list = []
+        sequence_lengths = []
+
         all_ids, all_masks, completions_text = generate_completions(
             rollout_client,
             tokenizer,
@@ -545,7 +545,6 @@ for step in range(num_steps):
 
         ids_expanded = []
         kwargs_expanded = []
-        
         for prompt_idx in range(len(prompts)):
             ids = json.loads(batch["instruction_id_list"][prompt_idx])
             kws = json.loads(batch["kwargs"][prompt_idx])
@@ -597,6 +596,8 @@ for step in range(num_steps):
         assert total_seqs % args.device_batch_size == 0
         num_passes = total_seqs // args.device_batch_size
 
+        optimizer.zero_grad(set_to_none=True)
+
         model.train()
         for pass_idx in range(num_passes):
             b0 = pass_idx * args.device_batch_size
@@ -645,7 +646,6 @@ for step in range(num_steps):
     })
 
     optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
     scheduler.step()
     wandb_run.log({
         "step": step,
