@@ -470,20 +470,20 @@ optimizer = torch.optim.AdamW(
     fused=(device.type == "cuda"),
 )
 
+num_steps = (len(train_dataset) // args.examples_per_step) * args.num_epochs
+print0(f"Calculated number of steps: {num_steps}")
+
 def get_lr_lambda(step: int) -> float:
     if args.lr_scheduler_type != "linear":
         return 1.0
     if step < args.warmup_steps:
         return (step + 1) / max(args.warmup_steps, 1)
-    remaining_steps = max(args.max_steps - args.warmup_steps, 1)
+    remaining_steps = max(num_steps - args.warmup_steps, 1)
     decay_step = min(step - args.warmup_steps, remaining_steps)
     return max(0.0, 1.0 - decay_step / remaining_steps)
 
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
-
-num_steps = (len(train_dataset) // args.examples_per_step) * args.num_epochs
-print0(f"Calculated number of steps: {num_steps}")
 
 # data_iter = iter(loader)
 sample_output_jsonl_path = resolve_sample_output_jsonl_path(
