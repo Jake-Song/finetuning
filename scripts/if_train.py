@@ -415,7 +415,7 @@ def get_batch():
             top_p=args.top_p,
             num_generations=args.num_generations,
         )
-
+        print("all_ids", all_ids)
         max_len = max(len(s) for s in all_ids)
         input_ids = []
         attention_masks = []
