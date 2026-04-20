@@ -130,29 +130,25 @@ class OpenAICompatibleRolloutClient:
         temperature: float,
         top_p: float,
         num_generations: int,
-    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
-        all_input_ids: list[list[int]] = []
-        all_completion_masks: list[list[int]] = []
+    ) -> tuple[list[int], list[int], list[str]]:
+        all_input_ids: list[int] = []
+        all_completion_masks: list[int] = []
         all_texts: list[str] = []
 
         max_workers = self.max_parallel_requests
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._generate_one,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    num_generations=num_generations,
-                )
-            ]
-            for future in futures:
-                ids, masks, texts = future.result()
-                all_input_ids.extend(ids)
-                all_completion_masks.extend(masks)
-                all_texts.extend(texts)
+            future = executor.submit(
+                self._generate_one,
+                tokenizer,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                num_generations=num_generations,
+            )
+            
+            all_input_ids, all_completion_masks, all_texts = future.result()
+               
 
         return all_input_ids, all_completion_masks, all_texts
 
