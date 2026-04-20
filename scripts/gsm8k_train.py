@@ -91,6 +91,7 @@ class TrainConfig:
     max_steps: int = 150
     output_dir: str = "./ckpt_grpo_gsm8k"
     report_dir: str = "./report"
+    sample_output_jsonl: str | None = None
     save_steps: int = 50
     logging_steps: int = 1
     eval_steps: int = 50
@@ -344,6 +345,41 @@ def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> No
             for k in sorted(metrics.keys())
         )
         f.write(f"| {step} | {timestamp} | {values} |\n")
+
+
+def resolve_sample_output_jsonl_path(
+    path_arg: str | None,
+    output_dir: str,
+    rank: int,
+    world_size: int,
+) -> str | None:
+    if path_arg is None:
+        return None
+
+    if path_arg == "__AUTO__":
+        filename = "train_samples.jsonl" if world_size == 1 else f"train_samples.rank{rank}.jsonl"
+        return os.path.join(output_dir, filename)
+
+    if world_size == 1:
+        return path_arg
+
+    root, ext = os.path.splitext(path_arg)
+    if ext:
+        return f"{root}.rank{rank}{ext}"
+    return f"{path_arg}.rank{rank}"
+
+
+def append_sample_rows(path: str | None, rows: list[dict[str, Any]]) -> None:
+    if path is None or not rows:
+        return
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def _format_report_metric(value: float | int | None) -> str:
@@ -618,6 +654,7 @@ def dry_run(cfg: TrainConfig, resume_from_checkpoint: str | None = None):
     print(f"  lr:               {cfg.learning_rate}")
     print(f"  max_steps:        {cfg.max_steps}")
     print(f"  output_dir:       {cfg.output_dir}")
+    print(f"  sample_output:    {cfg.sample_output_jsonl or 'disabled'}")
     print(f"  vllm_server:      {cfg.vllm_server_host}:{cfg.vllm_server_port}")
     print(f"  vllm_sync:        {cfg.vllm_weight_sync_backend}")
     print(f"  hf_token:         {'set' if HF_TOKEN else 'not set'}")
@@ -678,6 +715,13 @@ def main():
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps")
     parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
+    parser.add_argument(
+        "--sample-output-jsonl",
+        nargs="?",
+        const="__AUTO__",
+        default=None,
+        help="Optionally save training samples to JSONL. Defaults to <output_dir>/train_samples[.rankN].jsonl when enabled without a path.",
+    )
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -694,10 +738,16 @@ def main():
         overrides["max_steps"] = args.max_steps
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
+    if args.sample_output_jsonl is not None:
+        overrides["sample_output_jsonl"] = args.sample_output_jsonl
     
     for k, v in overrides.items():
         if hasattr(cfg, k):
-            setattr(cfg, k, type(getattr(cfg, k))(v))
+            current_value = getattr(cfg, k)
+            if current_value is None:
+                setattr(cfg, k, v)
+            else:
+                setattr(cfg, k, type(current_value)(v))
 
     model_source = resolve_model_source(cfg, args.resume_from_checkpoint)
     
@@ -822,6 +872,14 @@ def main():
 
     print0(f"Prompts per rank: {prompts_per_rank}, Generations per prompt: {cfg.num_generations}")
     print0(f"Max steps: {cfg.max_steps}, Warmup: {cfg.warmup_steps}")
+    sample_output_jsonl_path = resolve_sample_output_jsonl_path(
+        cfg.sample_output_jsonl,
+        cfg.output_dir,
+        ddp_rank,
+        ddp_world_size,
+    )
+    if sample_output_jsonl_path:
+        print0(f"Training samples will be appended to {sample_output_jsonl_path}")
 
     data_iter = iter(loader)
     run_start_time = time.perf_counter()
@@ -874,6 +932,22 @@ def main():
             rewards_t = torch.tensor([s["reward"] for s in completion_stats], dtype=torch.float, device=device)
             format_rate = sum(s["format"] for s in completion_stats) / max(len(completion_stats), 1)
             exact_match_rate = sum(s["exact_match"] for s in completion_stats) / max(len(completion_stats), 1)
+            sample_rows = []
+            for sample_idx, completion in enumerate(completions_text):
+                prompt_idx = sample_idx // cfg.num_generations
+                generation_idx = sample_idx % cfg.num_generations
+                sample_rows.append({
+                    "step": global_step + 1,
+                    "prompt_index": prompt_idx,
+                    "generation_index": generation_idx,
+                    "prompt": prompts[prompt_idx],
+                    "gold_answer": expanded_gold[sample_idx],
+                    "completion": completion,
+                    "reward": completion_stats[sample_idx]["reward"],
+                    "format": completion_stats[sample_idx]["format"],
+                    "exact_match": completion_stats[sample_idx]["exact_match"],
+                })
+            append_sample_rows(sample_output_jsonl_path, sample_rows)
 
             rewards_grouped = rewards_t.view(-1, cfg.num_generations)
             mu = rewards_grouped.mean(dim=1, keepdim=True)
