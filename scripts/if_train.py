@@ -609,7 +609,7 @@ for step in range(num_steps):
 
 
 
-        total_seqs = inputs_all.size[0]
+        total_seqs = inputs_all.shape[0]
         assert total_seqs % args.device_batch_size == 0
         num_passes = total_seqs // args.device_batch_size
 
