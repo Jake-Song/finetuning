@@ -158,8 +158,8 @@ def dry_run() -> None:
     print("\n[Tokenizer]")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, token=HF_TOKEN)
     print(f"  vocab_size:  {tokenizer.vocab_size}")
-    print(f"  pad_token:   {tokenizer.pad_token}")
-    print(f"  eos_token:   {tokenizer.eos_token}")
+    print(f"  pad_token:   {tokenizer.encode(tokenizer.pad_token)}")
+    print(f"  eos_token:   {tokenizer.encode(tokenizer.eos_token)}")
 
     print(f"\n{'=' * 60}")
     print("DRY RUN COMPLETE")
@@ -451,6 +451,9 @@ print0(f"Train dataset: {len(train_dataset)} examples")
 if eval_dataset:
     print0(f"Eval dataset: {len(eval_dataset)} examples (every {args.eval_steps} steps)")
 
+examples_per_rank = args.examples_per_step // ddp_world_size
+print0(f"Calculated examples per rank: {examples_per_rank}")
+
 sampler = (
     DistributedSampler(
         train_dataset,
@@ -464,7 +467,7 @@ sampler = (
 )
 loader = DataLoader(
     train_dataset,
-    batch_size=args.device_batch_size,
+    batch_size=examples_per_rank,
     sampler=sampler,
     shuffle=(sampler is None),
     drop_last=True,
@@ -492,9 +495,6 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
 
 num_steps = (len(train_dataset) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
-
-examples_per_rank = args.examples_per_step // ddp_world_size
-print0(f"Calculated examples per rank: {examples_per_rank}")
 
 data_iter = iter(loader)
 sample_output_jsonl_path = resolve_sample_output_jsonl_path(
@@ -526,8 +526,8 @@ for step in range(num_steps):
     batch = next(data_iter)
 
     prompts = list(batch["prompt"])
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    
     rewards_list = []
     sequence_lengths = []
     for example_step in range(examples_per_rank):   
