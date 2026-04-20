@@ -124,7 +124,7 @@ class OpenAICompatibleRolloutClient:
     def generate_completions(
         self,
         tokenizer,
-        prompts: list[str],
+        prompt: str,
         *,
         max_new_tokens: int,
         temperature: float,
@@ -135,7 +135,7 @@ class OpenAICompatibleRolloutClient:
         all_completion_masks: list[list[int]] = []
         all_texts: list[str] = []
 
-        max_workers = max(1, min(self.max_parallel_requests, len(prompts)))
+        max_workers = self.max_parallel_requests
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
@@ -147,7 +147,6 @@ class OpenAICompatibleRolloutClient:
                     top_p=top_p,
                     num_generations=num_generations,
                 )
-                for prompt in prompts
             ]
             for future in futures:
                 ids, masks, texts = future.result()

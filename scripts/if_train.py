@@ -95,7 +95,7 @@ user_config = vars(args).copy()
 def generate_completions(
     rollout_client: OpenAICompatibleRolloutClient,
     tokenizer,
-    prompts: list[str],
+    prompt: str,
     *,
     max_new_tokens: int,
     temperature: float,
@@ -104,7 +104,7 @@ def generate_completions(
 ) -> tuple[list[list[int]], list[list[int]], list[str]]:
     return rollout_client.generate_completions(
         tokenizer,
-        list(prompts),
+        prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
@@ -409,7 +409,7 @@ def get_batch():
         all_ids, all_masks, completions_text = generate_completions(
             rollout_client,
             tokenizer,
-            [prompt],
+            prompt,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
