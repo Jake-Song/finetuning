@@ -550,8 +550,8 @@ for step in range(num_steps):
             ids_expanded.extend([ids] * args.num_generations)
             kwargs_expanded.extend([kws] * args.num_generations)
 
-        rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
-        rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
+        rewards_all = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
+        rewards_all = torch.tensor(rewards_all, dtype=torch.float, device=device)
 
         sample_rows = []
         for sample_idx, completion in enumerate(completions_text):
@@ -577,10 +577,9 @@ for step in range(num_steps):
             })
         append_sample_rows(sample_output_jsonl_path, sample_rows)
 
-        rewards_grouped = rewards_t.view(-1, args.num_generations)
-        mu = rewards_grouped.mean(dim=1, keepdim=True)
-        std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
-        advantages_all = (rewards_grouped - mu) / std
+        mu = rewards_all.mean()
+        std = rewards_all.std().clamp(min=1e-8)
+        advantages_all = (rewards_all - mu) / std
 
         input_ids, attention_mask, completion_mask = pad_and_stack(all_ids, all_masks, pad_id)
         
@@ -604,7 +603,7 @@ for step in range(num_steps):
             logits = model(input_ids=inputs_all[b0:b1], attention_mask=attention_mask[b0:b1, :-1]).logits
             targets = targets_all[b0:b1]
             token_mask = completion_mask[b0:b1, 1:].float()
-            rewards = rewards_t[b0:b1]
+            rewards = rewards_all[b0:b1]
             
             advantages = advantages_all[b0:b1]
             log_probs = -F.cross_entropy(
@@ -622,7 +621,7 @@ for step in range(num_steps):
             loss.backward()
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
             
-        rewards_list.append(rewards_t.mean().item())
+        rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in completions_text)
 
     # A bunch of logging for how the rollouts went this step
