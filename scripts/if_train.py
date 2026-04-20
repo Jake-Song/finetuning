@@ -74,9 +74,7 @@ parser.add_argument("--eval-size", type=int, default=50, help="eval size")
 parser.add_argument("--seed", type=int, default=42, help="random seed")
 
 # Optimization
-parser.add_argument("--lr-scheduler-type", type=str, default="linear", help="learning rate scheduler type")
 parser.add_argument("--learning-rate", type=float, default=3e-6, help="learning rate")
-parser.add_argument("--warmup-steps", type=int, default=10, help="warmup steps")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay")
 
 # vLLM server
@@ -474,13 +472,7 @@ num_steps = (len(train_dataset) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 
 def get_lr_lambda(step: int) -> float:
-    if args.lr_scheduler_type != "linear":
-        return 1.0
-    if step < args.warmup_steps:
-        return (step + 1) / max(args.warmup_steps, 1)
-    remaining_steps = max(num_steps - args.warmup_steps, 1)
-    decay_step = min(step - args.warmup_steps, remaining_steps)
-    return max(0.0, 1.0 - decay_step / remaining_steps)
+    return max(0.0, 1.0 - (step + 1) / max(num_steps, 1))
 
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
