@@ -118,54 +118,6 @@ def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
     return full, None
 
 
-def dry_run() -> None:
-    print("=" * 60)
-    print("IFEVAL GRPO NATIVE PYTORCH DRY RUN")
-    print("=" * 60)
-
-    print("\n[Config]")
-    print(f"  model:              {MODEL_ID}")
-    print(f"  dataset:            {DATASET_NAME} ({DATASET_CONFIG})")
-    print(f"  max_prompt_length:  {MAX_PROMPT_LENGTH}")
-    print(f"  num_generations:    {args.num_generations}")
-    print(f"  examples_per_step:  {args.examples_per_step}")
-    print(f"  device_batch_size:  {args.device_batch_size}")
-    print(f"  max_new_tokens:     {args.max_new_tokens}")
-    print(f"  learning_rate:      {args.learning_rate}")
-    print(f"  num_epochs:         {args.num_epochs}")
-    print(f"  output_dir:         {args.output_dir}")
-    print(f"  vllm_server:        {args.vllm_server_host}:{args.vllm_server_port}")
-    print(f"  hf_token:           {'set' if HF_TOKEN else 'not set'}")
-
-    print("\n[Dataset]")
-    train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size)
-    print(f"  train samples: {len(train_dataset)}")
-    print(f"  eval samples:  {len(eval_dataset) if eval_dataset else 0}")
-
-    first = train_dataset[0]
-    instruction_ids = json.loads(first["instruction_id_list"])
-    kwargs = json.loads(first["kwargs"])
-    print(f"\n  First prompt preview: {first['prompt'][:150]}...")
-    print(f"  First instruction ids: {instruction_ids}")
-    print(f"  First kwargs: {kwargs}")
-
-    print("\n[Reward function test]")
-    test_completion = "This is a dry-run completion used to validate reward evaluation plumbing."
-    summary = summarize_constraint_evaluation(test_completion, instruction_ids, kwargs)
-    print(f"  reward:      {summary['reward']:.4f}")
-    print(f"  all_passed:  {summary['all_passed']}")
-
-    print("\n[Tokenizer]")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, token=HF_TOKEN)
-    print(f"  vocab_size:  {tokenizer.vocab_size}")
-    print(f"  pad_token:   {tokenizer.encode(tokenizer.pad_token)}")
-    print(f"  eos_token:   {tokenizer.encode(tokenizer.eos_token)}")
-
-    print(f"\n{'=' * 60}")
-    print("DRY RUN COMPLETE")
-    print("=" * 60)
-
-
 def generate_completions(
     rollout_client: OpenAICompatibleRolloutClient,
     tokenizer,
@@ -396,11 +348,6 @@ def run_eval(
         "eval/reward_std": std_reward,
         "eval/num_completions": count.item(),
     }
-
-
-if args.dry_run:
-    dry_run()
-    raise SystemExit(0)
 
 device_type = autodetect_device_type()
 if device_type != "cuda":
