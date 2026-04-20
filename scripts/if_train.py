@@ -51,7 +51,7 @@ parser.add_argument("--max-new-tokens", type=int, default=512, help="max tokens 
 
 # Training
 parser.add_argument("--num-generations", type=int, default=16, help="number of generations per example/question")
-parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
+parser.add_argument("--examples-per-step", type=int, default=8, help="total examples per optimization step across all ranks")
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over IFEval")
 
