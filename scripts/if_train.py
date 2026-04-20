@@ -58,6 +58,13 @@ parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs 
 
 # Output
 parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
+parser.add_argument(
+    "--sample-output-jsonl",
+    nargs="?",
+    const="__AUTO__",
+    default=None,
+    help="Optionally save training samples to JSONL. Defaults to <output_dir>/train_samples[.rankN].jsonl when enabled without a path.",
+)
 
 # Checkpointing
 parser.add_argument("--output-dir", type=str, default="./ckpt_grpo_ifeval", help="output directory")
@@ -215,6 +222,41 @@ def append_eval_log(output_dir: str, step: int, metrics: dict[str, float]) -> No
             for k in sorted(metrics.keys())
         )
         f.write(f"| {step} | {timestamp} | {values} |\n")
+
+
+def resolve_sample_output_jsonl_path(
+    path_arg: str | None,
+    output_dir: str,
+    rank: int,
+    world_size: int,
+) -> str | None:
+    if path_arg is None:
+        return None
+
+    if path_arg == "__AUTO__":
+        filename = "train_samples.jsonl" if world_size == 1 else f"train_samples.rank{rank}.jsonl"
+        return os.path.join(output_dir, filename)
+
+    if world_size == 1:
+        return path_arg
+
+    root, ext = os.path.splitext(path_arg)
+    if ext:
+        return f"{root}.rank{rank}{ext}"
+    return f"{path_arg}.rank{rank}"
+
+
+def append_sample_rows(path: str | None, rows: list[dict]) -> None:
+    if path is None or not rows:
+        return
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 def save_checkpoint(
     checkpoint_dir: str,
@@ -455,6 +497,12 @@ examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
 data_iter = iter(loader)
+sample_output_jsonl_path = resolve_sample_output_jsonl_path(
+    args.sample_output_jsonl,
+    args.output_dir,
+    ddp_rank,
+    ddp_world_size,
+)
 
 for step in range(num_steps):
 
@@ -504,6 +552,30 @@ for step in range(num_steps):
 
         rewards = compute_rewards(completions_text, ids_expanded, kwargs_expanded)
         rewards_t = torch.tensor(rewards, dtype=torch.float, device=device)
+
+        sample_rows = []
+        for sample_idx, completion in enumerate(completions_text):
+            prompt_idx = sample_idx // args.num_generations
+            generation_idx = sample_idx % args.num_generations
+            summary = summarize_constraint_evaluation(
+                completion,
+                ids_expanded[sample_idx],
+                kwargs_expanded[sample_idx],
+            )
+            sample_rows.append({
+                "step": step,
+                "example_step": example_step,
+                "prompt_index": prompt_idx,
+                "generation_index": generation_idx,
+                "prompt": prompts[prompt_idx],
+                "instruction_id_list": ids_expanded[sample_idx],
+                "kwargs": kwargs_expanded[sample_idx],
+                "completion": completion,
+                "reward": summary["reward"],
+                "all_passed": summary["all_passed"],
+                "constraint_results": summary["results"],
+            })
+        append_sample_rows(sample_output_jsonl_path, sample_rows)
 
         rewards_grouped = rewards_t.view(-1, args.num_generations)
         mu = rewards_grouped.mean(dim=1, keepdim=True)
