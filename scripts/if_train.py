@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import time
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 from datetime import datetime, timezone
 
@@ -162,6 +163,17 @@ def append_sample_rows(path: str | None, rows: list[dict]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 def save_checkpoint(
     checkpoint_dir: str,
@@ -483,7 +495,9 @@ sample_output_jsonl_path = resolve_sample_output_jsonl_path(
 
 
 batch_iterator = get_batch()
+run_start_time = time.perf_counter()
 for step in range(num_steps):
+    step_start_time = time.perf_counter()
        
     sync_server_model_weights(
         host=args.vllm_server_host,
@@ -597,18 +611,26 @@ for step in range(num_steps):
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
 
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    step_duration_sec = time.perf_counter() - step_start_time
+    iter_per_sec = 1.0 / max(step_duration_sec, 1e-12)
+    steps_remaining = max(num_steps - (step + 1), 0)
+    eta_seconds = steps_remaining / max(iter_per_sec, 1e-12)
+
+    print0(
+        f"Step {step + 1}/{num_steps} | Average reward: {mean_reward} | "
+        f"Average sequence length: {mean_sequence_length:.2f} | "
+        f"iter/sec={iter_per_sec:.2f} | eta={format_duration(eta_seconds)}"
+    )
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
-    })
-
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    scheduler.step()
-    wandb_run.log({
-        "step": step,
+        "iter_per_sec": iter_per_sec,
+        "eta_seconds": eta_seconds,
+        "runtime_seconds": time.perf_counter() - run_start_time,
         "lrm": get_lr_lambda(step),
         "lr": optimizer.param_groups[0]["lr"],
     })
