@@ -505,8 +505,20 @@ sample_output_jsonl_path = resolve_sample_output_jsonl_path(
 )
 
 for step in range(num_steps):
-    optimizer.zero_grad(set_to_none=True)
-    
+       
+    sync_server_model_weights(
+        host=args.vllm_server_host,
+        port=args.vllm_server_port,
+        model=raw_model,
+        backend=args.vllm_weight_sync_backend,
+        timeout=args.vllm_sync_timeout,
+        is_sync_leader=master_process,
+        trainer_rank=ddp_rank,
+        trainer_world_size=ddp_world_size,
+    )
+    if ddp:
+        dist.barrier()
+
     if step > 0 and step % args.eval_steps == 0:
         model.eval()
         metrics = run_eval(
@@ -524,7 +536,6 @@ for step in range(num_steps):
             wandb_run.log({"step": step, **metrics})
             append_eval_log(args.output_dir, step, metrics)
 
-    
     for example_step in range(examples_per_rank):   
         batch = next(data_iter)
 
@@ -533,7 +544,6 @@ for step in range(num_steps):
         
         rewards_list = []
         sequence_lengths = []
-
         all_ids, all_masks, completions_text = generate_completions(
             rollout_client,
             tokenizer,
@@ -645,6 +655,7 @@ for step in range(num_steps):
     })
 
     optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     scheduler.step()
     wandb_run.log({
         "step": step,

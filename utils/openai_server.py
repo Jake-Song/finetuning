@@ -136,8 +136,6 @@ class OpenAICompatibleRolloutClient:
         all_texts: list[str] = []
 
         max_workers = max(1, min(self.max_parallel_requests, len(prompts)))
-        assert num_generations % max_workers == 0, f"num_generations {num_generations} must be divisible by max_workers {max_workers}"
-        num_generations_per_worker = num_generations // max_workers
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
@@ -147,7 +145,7 @@ class OpenAICompatibleRolloutClient:
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
-                    num_generations=num_generations_per_worker,
+                    num_generations=num_generations,
                 )
                 for prompt in prompts
             ]
