@@ -426,12 +426,12 @@ def get_batch():
             attention_masks.append([1] * len(seq) + [0] * pad_len)
             completion_masks.append(mask + [0] * pad_len)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=device),
+        ids = torch.tensor(input_ids, dtype=torch.long, device=device),
         attention_masks = torch.tensor(attention_masks, dtype=torch.long, device=device)
         completion_masks = torch.tensor(completion_masks, dtype=torch.long, device=device)
 
-        input_ids = input_ids[:, :-1]
-        targets = input_ids[:, 1:].clone() # clone to avoid in-place modification
+        inputs = ids[:, :-1]
+        targets = ids[:, 1:].clone() # clone to avoid in-place modification
         targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
 
         ids_expanded = []
@@ -447,7 +447,7 @@ def get_batch():
         std = rewards.std().clamp(min=1e-8)
         advantages = (rewards - mu) / std
         
-        yield completions_text, input_ids, targets, attention_masks, rewards, advantages
+        yield completions_text, inputs, targets, attention_masks, rewards, advantages
 
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
 examples_per_rank = args.examples_per_step // ddp_world_size
