@@ -76,6 +76,13 @@ parser.add_argument("--seed", type=int, default=42, help="random seed")
 # Optimization
 parser.add_argument("--learning-rate", type=float, default=3e-6, help="learning rate")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay")
+parser.add_argument(
+    "--advantage-normalization",
+    type=str,
+    default="zscore",
+    choices=("zscore", "centered"),
+    help="How to transform rewards into advantages",
+)
 
 # vLLM server
 parser.add_argument("--vllm-server-host", type=str, default="127.0.0.1", help="vLLM server host")
@@ -196,6 +203,7 @@ def save_checkpoint(
             "num_generations": args.num_generations,
             "examples_per_step": args.examples_per_step,
             "device_batch_size": args.device_batch_size,
+            "advantage_normalization": args.advantage_normalization,
         },
     }
     with open(os.path.join(checkpoint_dir, "trainer_state.json"), "w", encoding="utf-8") as f:
@@ -440,8 +448,13 @@ def get_batch():
             targets[completion_masks[:, 1:] == 0] = -1 # -1 is the ignore index
 
             mu = rewards.mean()
-            std = rewards.std().clamp(min=1e-8)
-            advantages = (rewards - mu) / std
+            if args.advantage_normalization == "zscore":
+                std = rewards.std().clamp(min=1e-8)
+                advantages = (rewards - mu) / std
+            elif args.advantage_normalization == "centered":
+                advantages = rewards - mu
+            else:
+                raise ValueError(f"Unsupported advantage normalization: {args.advantage_normalization}")
         
         yield (
             prompt,
