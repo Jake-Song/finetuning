@@ -181,6 +181,20 @@ def format_duration(seconds: float) -> str:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
 
+
+def compute_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+
+    if norm_type == math.inf:
+        return torch.stack([grad.abs().max() for grad in grads]).max()
+
+    device = grads[0].device
+    per_grad_norms = torch.stack([torch.norm(grad, norm_type).to(device) for grad in grads])
+    return torch.norm(per_grad_norms, norm_type)
+
+
 def save_checkpoint(
     checkpoint_dir: str,
     raw_model,
@@ -515,6 +529,8 @@ batch_iterator = get_batch()
 run_start_time = time.perf_counter()
 for step in range(num_steps):
     step_start_time = time.perf_counter()
+    entropy_sum = torch.zeros(1, dtype=torch.float32, device=device)
+    valid_token_count = torch.zeros(1, dtype=torch.float32, device=device)
        
     sync_server_model_weights(
         host=args.vllm_server_host,
@@ -578,16 +594,22 @@ for step in range(num_steps):
             attention_mask = attention_masks[b0:b1, :-1]
 
             logits = model(input_ids=inputs, attention_mask=attention_mask).logits
-            log_probs = -F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
+            token_log_probs = -F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
                 targets.reshape(-1),
                 reduction="none",
                 ignore_index=-1,
             ).view_as(targets)
+            full_log_probs = F.log_softmax(logits.float(), dim=-1)
+            probs = full_log_probs.exp()
+            token_entropy = -(probs * full_log_probs).sum(dim=-1)
+            token_mask = (targets >= 0).float()
       
-            pg_obj = (log_probs * advantages.unsqueeze(-1)).sum() 
-            num_valid = (targets >= 0).sum().clamp(min=1)
+            pg_obj = (token_log_probs * advantages.unsqueeze(-1)).sum() 
+            num_valid = token_mask.sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+            entropy_sum += (token_entropy * token_mask).sum()
+            valid_token_count += num_valid
             
             loss = -pg_obj
             loss.backward()
@@ -628,6 +650,14 @@ for step in range(num_steps):
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
 
+    mean_entropy = (entropy_sum / valid_token_count.clamp(min=1)).item()
+    grad_norm = compute_grad_norm(model.parameters()).to(device)
+    if ddp:
+        dist.all_reduce(entropy_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(valid_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(grad_norm, op=dist.ReduceOp.AVG)
+        mean_entropy = (entropy_sum / valid_token_count.clamp(min=1)).item()
+
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
@@ -639,12 +669,15 @@ for step in range(num_steps):
     print0(
         f"Step {step + 1}/{num_steps} | Average reward: {mean_reward} | "
         f"Average sequence length: {mean_sequence_length:.2f} | "
+        f"entropy={mean_entropy:.4f} | grad_norm={grad_norm.item():.4f} | "
         f"iter/sec={iter_per_sec:.2f} | eta={format_duration(eta_seconds)}"
     )
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
+        "grpo/entropy": mean_entropy,
+        "grad_norm": grad_norm.item(),
         "iter_per_sec": iter_per_sec,
         "eta_seconds": eta_seconds,
         "runtime_seconds": time.perf_counter() - run_start_time,
