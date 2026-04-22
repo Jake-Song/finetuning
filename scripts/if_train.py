@@ -72,6 +72,7 @@ parser.add_argument("--output-dir", type=str, default="./ckpt_grpo_ifeval", help
 parser.add_argument("--save-every", type=int, default=50, help="save every N steps")
 parser.add_argument("--eval-steps", type=int, default=50, help="eval every N steps")
 parser.add_argument("--eval-size", type=int, default=50, help="eval size")
+parser.add_argument("--max-train-examples", type=int, default=1200, help="Limit number of examples in the final training split")
 parser.add_argument("--seed", type=int, default=42, help="random seed")
 
 # Optimization
@@ -205,6 +206,7 @@ def save_checkpoint(
             "num_generations": args.num_generations,
             "examples_per_step": args.examples_per_step,
             "device_batch_size": args.device_batch_size,
+            "max_train_examples": args.max_train_examples,
             "advantage_normalization": args.advantage_normalization,
         },
     }
@@ -368,7 +370,7 @@ rollout_client = OpenAICompatibleRolloutClient(
     max_parallel_requests=args.vllm_max_parallel_requests,
 )
 
-def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
+def load_ifeval_dataset(eval_size: int, max_train_examples: int | None) -> tuple[Dataset, Dataset | None]:
     ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 
@@ -401,10 +403,21 @@ def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
     full = Dataset.from_list(rows)
     if eval_size > 0 and eval_size < len(full):
         splits = full.train_test_split(test_size=eval_size, seed=42)
-        return splits["train"], splits["test"]
-    return full, None
+        train_dataset = splits["train"]
+        eval_dataset = splits["test"]
+    else:
+        train_dataset = full
+        eval_dataset = None
 
-train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size)
+    if max_train_examples is not None:
+        if max_train_examples <= 0:
+            raise ValueError("--max-train-examples must be a positive integer.")
+        if max_train_examples < len(train_dataset):
+            train_dataset = train_dataset.select(range(max_train_examples))
+
+    return train_dataset, eval_dataset
+
+train_dataset, eval_dataset = load_ifeval_dataset(args.eval_size, args.max_train_examples)
 print0(f"Train dataset: {len(train_dataset)} examples")
 if eval_dataset:
     print0(f"Eval dataset: {len(eval_dataset)} examples (every {args.eval_steps} steps)")
@@ -485,6 +498,11 @@ def get_batch():
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
 examples_per_rank = args.examples_per_step // ddp_world_size
 print0(f"Calculated examples per rank: {examples_per_rank}")
+if len(train_dataset) < args.examples_per_step:
+    raise ValueError(
+        "Training dataset is smaller than --examples-per-step after applying --max-train-examples. "
+        "Increase --max-train-examples or lower --examples-per-step."
+    )
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
