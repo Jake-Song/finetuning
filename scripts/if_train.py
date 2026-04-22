@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -36,7 +37,7 @@ load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN")
   
 MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-DATASET_NAME = "google/IFEval"
+DATASET_NAME = "allenai/IF_multi_constraints_upto5"
 DATASET_CONFIG = "default"
 MAX_PROMPT_LENGTH = 512
 
@@ -372,18 +373,29 @@ def load_ifeval_dataset(eval_size: int) -> tuple[Dataset, Dataset | None]:
 
     rows = []
     for example in ds:
-        prompt_text = (example.get("prompt") or "").strip()
+        messages = example.get("messages") or []
+        if not messages:
+            continue
+        prompt_text = (messages[0].get("content") or "").strip()
         if not prompt_text:
-            raise ValueError(f"No usable rows found in dataset {DATASET_NAME}/{DATASET_CONFIG}. Expected prompt field.")
+            continue
 
         tokens = tokenizer.encode(prompt_text, truncation=True, max_length=MAX_PROMPT_LENGTH)
         prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
 
+        gt = ast.literal_eval(example["ground_truth"])[0]
+        instruction_ids = gt.get("instruction_id") or []
+        kwargs_raw = gt.get("kwargs") or []
+        kwargs_list = [kw if isinstance(kw, dict) else {} for kw in kwargs_raw]
+
         rows.append({
             "prompt": prompt_text,
-            "instruction_id_list": json.dumps(example.get("instruction_id_list") or []),
-            "kwargs": json.dumps(example.get("kwargs") or []),
+            "instruction_id_list": json.dumps(instruction_ids),
+            "kwargs": json.dumps(kwargs_list),
         })
+
+    if not rows:
+        raise ValueError(f"No usable rows found in dataset {DATASET_NAME}/{DATASET_CONFIG}.")
 
     full = Dataset.from_list(rows)
     if eval_size > 0 and eval_size < len(full):
