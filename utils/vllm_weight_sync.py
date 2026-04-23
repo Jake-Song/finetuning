@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
+import pickle
 import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import pybase64 as base64
+import requests
 import torch
 import torch.distributed as dist
+from torch.multiprocessing.reductions import reduce_tensor
 
 _SYNC_CONTEXTS: dict[tuple[str, str, int], "WeightSyncContext"] = {}
 _SYNC_LOCK = threading.Lock()
@@ -85,16 +90,38 @@ def _init_ipc_transfer(base_url: str, timeout: float) -> None:
 
 
 def _send_ipc_weights(base_url: str, model) -> None:
-    from vllm.distributed.weight_transfer.ipc_engine import (
-        IPCTrainerSendWeightsArgs,
-        IPCWeightTransferEngine,
-    )
+    device_index = torch.accelerator.current_device_index()
+    props = torch.cuda.get_device_properties(device_index)
+    gpu_uuid = str(props.uuid)
 
-    trainer_args = IPCTrainerSendWeightsArgs(mode="http", url=base_url)
-    IPCWeightTransferEngine.trainer_send_weights(
-        iterator=model.named_parameters(),
-        trainer_args=trainer_args,
+    names = []
+    dtype_names = []
+    shapes = []
+    ipc_handles = []
+
+    for name, tensor in model.named_parameters():
+        names.append(name)
+        dtype_names.append(str(tensor.dtype).split(".")[-1])
+        shapes.append(list(tensor.shape))
+
+        weight = tensor.detach().contiguous()
+        ipc_handle = reduce_tensor(weight)
+        ipc_handles.append({gpu_uuid: ipc_handle})
+
+    pickled_handles = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+    response = requests.post(
+        f"{base_url}/update_weights",
+        json={
+            "update_info": {
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "ipc_handles_pickled": pickled_handles,
+            }
+        },
+        timeout=300,
     )
+    response.raise_for_status()
 
 
 def _spawn_http_post_thread(
@@ -165,6 +192,67 @@ def _get_vllm_network_utils() -> tuple[Any, Any]:
         return fallback_get_ip, fallback_get_open_port
 
 
+def _packed_broadcast_producer(
+    iterator,
+    group: Any,
+    src: int,
+    *,
+    buffer_size_bytes: int = 1024 * 1024 * 1024,
+    num_buffers: int = 2,
+) -> None:
+    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
+    buffer_idx = 0
+
+    packing_tensor_list: list[list[torch.Tensor]] = [[] for _ in range(num_buffers)]
+    packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]
+    packed_tensors: list[torch.Tensor] = [
+        torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
+    ]
+
+    while True:
+        streams[buffer_idx].synchronize()
+        with torch.cuda.stream(streams[buffer_idx]):
+            try:
+                packing_tensor_list[buffer_idx] = []
+                packing_tensor_sizes[buffer_idx] = 0
+                while True:
+                    _name, param = next(iterator)
+                    tensor = param.contiguous().view(torch.uint8).view(-1)
+                    packing_tensor_list[buffer_idx].append(tensor)
+                    packing_tensor_sizes[buffer_idx] += tensor.numel()
+                    if packing_tensor_sizes[buffer_idx] > buffer_size_bytes:
+                        break
+
+                packed_tensors[buffer_idx] = torch.cat(packing_tensor_list[buffer_idx], dim=0)
+                group.broadcast(packed_tensors[buffer_idx], src=src)
+                buffer_idx = (buffer_idx + 1) % num_buffers
+            except StopIteration:
+                if packing_tensor_list[buffer_idx]:
+                    packed_tensors[buffer_idx] = torch.cat(packing_tensor_list[buffer_idx], dim=0)
+                    group.broadcast(packed_tensors[buffer_idx], src=src)
+                break
+
+
+def _make_nccl_group(
+    *,
+    master_address: str,
+    master_port: int,
+    rank: int,
+    world_size: int,
+    device: int,
+):
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.utils import StatelessProcessGroup
+
+    process_group = StatelessProcessGroup.create(
+        host=master_address,
+        port=master_port,
+        rank=rank,
+        world_size=world_size,
+    )
+    return PyNcclCommunicator(process_group, device=device)
+
+
 def _ensure_nccl_initialized(
     base_url: str,
     timeout: float,
@@ -176,8 +264,6 @@ def _ensure_nccl_initialized(
 ) -> None:
     if context.initialized:
         return
-
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     get_ip, get_open_port = _get_vllm_network_utils()
 
@@ -221,11 +307,11 @@ def _ensure_nccl_initialized(
     if not isinstance(master_address, str) or not isinstance(master_port, int):
         raise RuntimeError("Failed to initialize NCCL weight sync rendezvous info for trainer ranks.")
 
-    context.group = NCCLWeightTransferEngine._stateless_init_process_group(
-        master_address,
-        master_port,
-        trainer_rank,
-        trainer_world_size + 1,
+    context.group = _make_nccl_group(
+        master_address=master_address,
+        master_port=master_port,
+        rank=trainer_rank,
+        world_size=trainer_world_size + 1,
         device=torch.accelerator.current_device_index(),
     )
     _dist_barrier(trainer_world_size)
@@ -309,19 +395,10 @@ def sync_server_model_weights(
                 raise RuntimeError(str(setup_error))
             _dist_barrier(trainer_world_size)
             try:
-                from vllm.distributed.weight_transfer.nccl_engine import (
-                    NCCLTrainerSendWeightsArgs,
-                    NCCLWeightTransferEngine,
-                )
-
-                trainer_args = NCCLTrainerSendWeightsArgs(
+                _packed_broadcast_producer(
+                    iterator=iter(model.named_parameters()),
                     group=context.group,
                     src=0,
-                    packed=True,
-                )
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=model.named_parameters(),
-                    trainer_args=trainer_args,
                 )
                 _dist_barrier(trainer_world_size)
                 finish_error: str | None = None
