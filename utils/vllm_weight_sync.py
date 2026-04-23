@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import json
 import threading
-import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from openai import OpenAI
 
 _SYNC_CONTEXTS: dict[tuple[str, str, int], "WeightSyncContext"] = {}
 _SYNC_LOCK = threading.Lock()
@@ -50,117 +47,6 @@ def _http_post_json(url: str, payload: dict[str, Any] | None, timeout: float) ->
         if not body:
             return {}
         return json.loads(body.decode("utf-8"))
-
-
-def _get_text_content(message_content: Any) -> str:
-    if isinstance(message_content, str):
-        return message_content
-    if isinstance(message_content, list):
-        parts = []
-        for item in message_content:
-            if isinstance(item, dict):
-                if item.get("type") == "text" and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-                elif item.get("type") == "output_text" and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-        return "".join(parts)
-    return str(message_content or "")
-
-
-@dataclass
-class OpenAICompatibleRolloutClient:
-    host: str
-    port: int
-    model_name: str
-    api_key: str = "EMPTY"
-    request_timeout: float = 300.0
-    max_parallel_requests: int = 8
-
-    def __post_init__(self) -> None:
-        self.server_base_url = f"http://{self.host}:{self.port}"
-        self.client = OpenAI(
-            base_url=f"{self.server_base_url}/v1",
-            api_key=self.api_key,
-            timeout=self.request_timeout,
-        )
-
-    def _generate_one(
-        self,
-        tokenizer,
-        prompt: str,
-        *,
-        max_new_tokens: int,
-        temperature: float,
-        top_p: float,
-        num_generations: int,
-    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
-        messages = [{"role": "user", "content": prompt}]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            max_tokens=max_new_tokens,
-            temperature=temperature if temperature > 0 else 1.0,
-            top_p=top_p,
-            n=num_generations,
-        )
-
-        all_input_ids = []
-        all_completion_masks = []
-        all_texts = []
-        for choice in response.choices:
-            text = _get_text_content(choice.message.content).strip()
-            completion_ids = tokenizer.encode(text, add_special_tokens=False)
-            seq_ids = prompt_ids + completion_ids
-            mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
-            all_input_ids.append(seq_ids)
-            all_completion_masks.append(mask)
-            all_texts.append(text)
-
-        return all_input_ids, all_completion_masks, all_texts
-
-    def generate_completions(
-        self,
-        tokenizer,
-        prompt: str | list[str],
-        *,
-        max_new_tokens: int,
-        temperature: float,
-        top_p: float,
-        num_generations: int,
-    ) -> tuple[list[list[int]], list[list[int]], list[str]]:
-        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        if not prompts:
-            return [], [], []
-
-        all_input_ids: list[list[int]] = []
-        all_completion_masks: list[list[int]] = []
-        all_texts: list[str] = []
-
-        max_workers = min(self.max_parallel_requests, len(prompts))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._generate_one,
-                    tokenizer,
-                    prompt_text,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    num_generations=num_generations,
-                )
-                for prompt_text in prompts
-            ]
-
-            for future in futures:
-                input_ids, completion_masks, texts = future.result()
-                all_input_ids.extend(input_ids)
-                all_completion_masks.extend(completion_masks)
-                all_texts.extend(texts)
-
-        return all_input_ids, all_completion_masks, all_texts
 
 
 @dataclass
@@ -211,27 +97,6 @@ def _send_ipc_weights(base_url: str, model) -> None:
     )
 
 
-def _update_nccl_metadata(
-    base_url: str,
-    names: list[str],
-    dtype_names: list[str],
-    shapes: list[list[int]],
-    timeout: float,
-) -> None:
-    _http_post_json(
-        f"{base_url}/update_weights",
-        {
-            "update_info": {
-                "names": names,
-                "dtype_names": dtype_names,
-                "shapes": shapes,
-                "packed": True,
-            }
-        },
-        timeout,
-    )
-
-
 def _spawn_http_post_thread(
     url: str,
     payload: dict[str, Any] | None,
@@ -242,7 +107,7 @@ def _spawn_http_post_thread(
     def runner() -> None:
         try:
             result.response = _http_post_json(url, payload, timeout)
-        except Exception as exc:  # pragma: no cover - propagated on join
+        except Exception as exc:  # pragma: no cover
             result.error = exc
 
     thread = threading.Thread(target=runner)
@@ -271,6 +136,35 @@ def _broadcast_objects(values: list[Any], trainer_world_size: int) -> list[Any]:
     return values
 
 
+def _get_vllm_network_utils() -> tuple[Any, Any]:
+    try:
+        from vllm.utils.network_utils import get_ip, get_open_port
+
+        return get_ip, get_open_port
+    except Exception:
+        import socket
+        import warnings
+
+        def fallback_get_ip() -> str:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.connect(("8.8.8.8", 80))
+                    return sock.getsockname()[0]
+            except Exception:
+                warnings.warn(
+                    "Failed to determine a routable IP via the trainer-side vLLM shim; using 0.0.0.0.",
+                    stacklevel=2,
+                )
+                return "0.0.0.0"
+
+        def fallback_get_open_port() -> int:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", 0))
+                return int(sock.getsockname()[1])
+
+        return fallback_get_ip, fallback_get_open_port
+
+
 def _ensure_nccl_initialized(
     base_url: str,
     timeout: float,
@@ -284,7 +178,8 @@ def _ensure_nccl_initialized(
         return
 
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-    from vllm.utils.network_utils import get_ip, get_open_port
+
+    get_ip, get_open_port = _get_vllm_network_utils()
 
     if trainer_world_size > 1 and (not dist.is_available() or not dist.is_initialized()):
         raise RuntimeError(_NCCL_DISTRIBUTED_MESSAGE)

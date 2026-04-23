@@ -11,6 +11,8 @@ data/
 
 # Virtual environments
 .venv
+envs/*/.venv
+.uv-cache/
 
 # environment variables
 .env

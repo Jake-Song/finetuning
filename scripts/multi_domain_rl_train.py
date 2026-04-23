@@ -43,7 +43,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.common import DummyWandb, autodetect_device_type, compute_init, print0
-from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model_weights
+from utils.rollout_client import OpenAICompatibleRolloutClient
+from utils.vllm_weight_sync import sync_server_model_weights
 
 load_dotenv()
 

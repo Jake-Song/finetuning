@@ -48,7 +48,8 @@ from utils.common import (
     compute_init,
     print0,
 )
-from utils.openai_server import OpenAICompatibleRolloutClient, sync_server_model_weights
+from utils.rollout_client import OpenAICompatibleRolloutClient
+from utils.vllm_weight_sync import sync_server_model_weights
 
 load_dotenv()
 
