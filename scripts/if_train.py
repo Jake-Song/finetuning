@@ -51,7 +51,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Generation
 parser.add_argument("--temperature", type=float, default=0.7, help="sampling temperature")
 parser.add_argument("--top-p", type=float, default=1.0, help="top-p sampling")
-parser.add_argument("--max-new-tokens", type=int, default=4096, help="max tokens to generate per sample")
+parser.add_argument("--max-new-tokens", type=int, default=17425, help="max tokens to generate per sample")
 
 # Training
 parser.add_argument("--num-generations", type=int, default=16, help="number of generations per example/question")
