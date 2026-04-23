@@ -13,7 +13,7 @@ dependencies = [
     "openai==2.31.0",
     "wandb==0.25.1",
     "python-dotenv==1.2.2",
-    "huggingface_hub>=0.34.0,<1.0",
+    "huggingface_hub>1.0",
     "psutil",
     "pyzmq",
     "pybase64",
@@ -23,3 +23,6 @@ dependencies = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tasks", "scripts"]   # list each folder
