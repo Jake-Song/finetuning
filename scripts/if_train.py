@@ -39,7 +39,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507-FP8"
 DATASET_NAME = "allenai/IF_multi_constraints_upto5"
 DATASET_CONFIG = "default"
-MAX_PROMPT_LENGTH = 512
+MAX_PROMPT_LENGTH = 4096
 
 parser = argparse.ArgumentParser(description="IFEval GRPO training (native PyTorch)")
 parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
@@ -49,7 +49,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Generation
 parser.add_argument("--temperature", type=float, default=0.7, help="sampling temperature")
 parser.add_argument("--top-p", type=float, default=1.0, help="top-p sampling")
-parser.add_argument("--max-new-tokens", type=int, default=512, help="max tokens to generate per sample")
+parser.add_argument("--max-new-tokens", type=int, default=4096, help="max tokens to generate per sample")
 
 # Training
 parser.add_argument("--num-generations", type=int, default=16, help="number of generations per example/question")
