@@ -241,8 +241,15 @@ def _make_nccl_group(
     world_size: int,
     device: int,
 ):
-    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    try:
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Trainer-side vLLM sync dependencies are unavailable in the current Python interpreter. "
+            "Run the trainer with ./setup/run_trainer.sh or envs/trainer/.venv/bin/python after "
+            "bootstrapping the environments with ./setup/bootstrap_envs.sh."
+        ) from exc
 
     process_group = StatelessProcessGroup.create(
         host=master_address,

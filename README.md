@@ -50,6 +50,7 @@ Dry runs validate config, dataset loading, tokenizer loading, and reward logic w
 ```
 
 Trainer model loading now requests `flash_attention_3` by default and falls back to `sdpa` automatically if FA3 cannot be dispatched.
+`./setup/run_trainer.sh` now dispatches directly to `envs/trainer/.venv/bin/python` or `torchrun`, so use it instead of a system `python` when training.
 
 ## 4. Run training
 
