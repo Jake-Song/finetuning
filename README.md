@@ -15,6 +15,12 @@ envs/trainer
 envs/vllm-server
 ```
 
+To install trainer-side FlashAttention-3 support:
+
+```bash
+./setup/install_flash_attn3.sh
+```
+
 ## 2. Start the vLLM server
 
 Use the helper script:
@@ -43,6 +49,8 @@ Dry runs validate config, dataset loading, tokenizer loading, and reward logic w
 ./setup/run_trainer.sh python scripts/multi_domain_rl_train.py --dry-run
 ```
 
+Trainer model loading now requests `flash_attention_3` by default and falls back to `sdpa` automatically if FA3 cannot be dispatched.
+
 ## 4. Run training
 
 ### IF-RL
@@ -50,7 +58,8 @@ Dry runs validate config, dataset loading, tokenizer loading, and reward logic w
 ```bash
 ./setup/run_trainer.sh python scripts/if_train.py \
   --vllm-server-host 127.0.0.1 \
-  --vllm-server-port 8000
+  --vllm-server-port 8000 \
+  --attn-implementation flash_attention_3
 ```
 
 ### SWE-RL
@@ -104,14 +113,17 @@ The trainers support these server-related options:
 --vllm-request-timeout
 --vllm-sync-timeout
 --vllm-weight-sync-backend
+--attn-implementation
 ```
 
 Use `--vllm-model-name` if the server model name differs from the trainer model name.
+Use `--attn-implementation sdpa` to bypass FA3 probing explicitly.
 
 ## 8. Notes
 
 - The server is used for rollout generation through the OpenAI-compatible Chat Completions API.
 - Weight sync is done separately through vLLM’s training/weight-transfer path.
+- FlashAttention-3 support is trainer-only in this repo; the vLLM server environment is unchanged.
 - The trainer environment can use a newer `transformers`, while the server environment stays pinned to the `vllm==0.19.0` compatible range.
 - The bootstrap step installs a trainer-side `vllm` shim with `--no-deps` so only weight-sync internals are imported in the trainer process.
 - NCCL weight sync in this repo supports multi-GPU trainers only when the vLLM server uses a single GPU worker.

@@ -37,6 +37,7 @@ import yaml
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.attention import load_causal_lm_with_attention
 from utils.common import (
     compute_init,
     compute_cleanup,
@@ -219,8 +220,11 @@ def main():
 
     # Teacher model (frozen)
     print0(f"Loading teacher model: {cfg.teacher_name}...")
-    teacher = AutoModelForCausalLM.from_pretrained(
-        cfg.teacher_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    teacher, _teacher_attn_implementation = load_causal_lm_with_attention(
+        cfg.teacher_name,
+        log_prefix="teacher model",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_3",
     )
     teacher.to(device)
     teacher.eval()
@@ -229,8 +233,11 @@ def main():
 
     # Student model
     print0(f"Loading student model: {cfg.student_name}...")
-    student = AutoModelForCausalLM.from_pretrained(
-        cfg.student_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    student, _student_attn_implementation = load_causal_lm_with_attention(
+        cfg.student_name,
+        log_prefix="student model",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_3",
     )
     student.config.use_cache = False
     student.to(device)

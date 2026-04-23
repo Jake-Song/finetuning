@@ -47,6 +47,7 @@ from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.attention import load_causal_lm_with_attention
 from utils.common import (
     compute_init,
     compute_cleanup,
@@ -67,6 +68,7 @@ class TrainConfig:
     max_prompt_length: int = 2048
     max_completion_length: int = 2048
     min_pass_rate: float = 0.0
+    attn_implementation: str = "flash_attention_3"
 
     # MOPD-specific
     use_mopd: bool = True
@@ -596,6 +598,7 @@ def main():
     parser.add_argument("--num-generations", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--attn-implementation", type=str, default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -620,6 +623,8 @@ def main():
         cfg.max_steps = args.max_steps
     if args.lr is not None:
         cfg.learning_rate = args.lr
+    if args.attn_implementation is not None:
+        cfg.attn_implementation = args.attn_implementation
 
     if args.dry_run:
         dry_run(cfg)
@@ -646,8 +651,11 @@ def main():
 
     # Train model (π_train)
     print0(f"Loading train model: {cfg.model_name}...")
-    train_model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    train_model, _resolved_attn_implementation = load_causal_lm_with_attention(
+        cfg.model_name,
+        log_prefix="train model",
+        torch_dtype=torch.bfloat16,
+        attn_implementation=cfg.attn_implementation,
     )
     train_model.config.use_cache = False
     train_model.to(device)
@@ -662,8 +670,11 @@ def main():
         # Teacher model (π_teacher) — frozen
         if cfg.teacher_name:
             print0(f"Loading teacher model: {cfg.teacher_name}...")
-            teacher_model = AutoModelForCausalLM.from_pretrained(
-                cfg.teacher_name, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+            teacher_model, _teacher_attn_implementation = load_causal_lm_with_attention(
+                cfg.teacher_name,
+                log_prefix="teacher model",
+                torch_dtype=torch.bfloat16,
+                attn_implementation=cfg.attn_implementation,
             )
         else:
             print0("Using frozen copy of initial model as teacher...")

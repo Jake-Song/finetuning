@@ -39,6 +39,7 @@ from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils.attention import load_causal_lm_with_attention
 from utils.common import (
     DummyWandb,
     autodetect_device_type,
@@ -58,6 +59,7 @@ class TrainConfig:
     dataset_name: str = "nvidia/Nemotron-Cascade-2-RL-data"
     dataset_config: str = "SWE-RL"
     max_prompt_length: int = 256
+    attn_implementation: str = "flash_attention_3"
 
     # GRPO
     num_generations: int = 4
@@ -578,6 +580,7 @@ def main():
     parser.add_argument("--vllm-request-timeout", type=float, default=None)
     parser.add_argument("--vllm-sync-timeout", type=float, default=None)
     parser.add_argument("--vllm-weight-sync-backend", type=str, default=None)
+    parser.add_argument("--attn-implementation", type=str, default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -608,6 +611,8 @@ def main():
         overrides["vllm_sync_timeout"] = args.vllm_sync_timeout
     if args.vllm_weight_sync_backend is not None:
         overrides["vllm_weight_sync_backend"] = args.vllm_weight_sync_backend
+    if args.attn_implementation is not None:
+        overrides["attn_implementation"] = args.attn_implementation
 
     for k, v in overrides.items():
         if hasattr(cfg, k):
@@ -638,10 +643,11 @@ def main():
 
     print0(f"Loading training model: {model_source}...")
     model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
+    model, _resolved_attn_implementation = load_causal_lm_with_attention(
         model_source,
+        log_prefix="training model",
         torch_dtype=model_dtype,
-        attn_implementation="sdpa",
+        attn_implementation=cfg.attn_implementation,
     )
     model.config.use_cache = False
     model.to(device)

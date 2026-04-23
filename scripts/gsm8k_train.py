@@ -42,6 +42,7 @@ from dotenv import load_dotenv
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.attention import load_causal_lm_with_attention
 from utils.common import (
     DummyWandb,
     autodetect_device_type,
@@ -67,6 +68,7 @@ class TrainConfig:
     dataset_name: str = "openai/gsm8k"
     dataset_config: str = "main"
     max_prompt_length: int = 256
+    attn_implementation: str = "flash_attention_3"
 
     # GRPO
     num_generations: int = 16
@@ -715,6 +717,7 @@ def main():
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--run", nargs="?", const="", metavar="PROJECT", help="Enable W&B logging")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps")
+    parser.add_argument("--attn-implementation", type=str, default=None)
     parser.add_argument("--report-dir", type=str, default=None, help="Directory for repo-level markdown reports")
     parser.add_argument(
         "--sample-output-jsonl",
@@ -737,6 +740,8 @@ def main():
             overrides["wandb_project"] = args.run
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
+    if args.attn_implementation is not None:
+        overrides["attn_implementation"] = args.attn_implementation
     if args.report_dir is not None:
         overrides["report_dir"] = args.report_dir
     if args.sample_output_jsonl is not None:
@@ -775,11 +780,12 @@ def main():
 
     print0(f"Loading training model: {model_source}...")
     model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
+    model, _resolved_attn_implementation = load_causal_lm_with_attention(
         model_source,
+        log_prefix="training model",
         token=HF_TOKEN,
         dtype=model_dtype,
-        attn_implementation="sdpa",
+        attn_implementation=cfg.attn_implementation,
     )
     model.config.use_cache = False
     model.to(device)

@@ -28,6 +28,7 @@ from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.attention import load_causal_lm_with_attention
 from utils.common import DummyWandb, autodetect_device_type, compute_init, print0, compute_cleanup
 from utils.rollout_client import OpenAICompatibleRolloutClient
 from utils.vllm_weight_sync import sync_server_model_weights
@@ -96,6 +97,12 @@ parser.add_argument("--vllm-request-timeout", type=float, default=300.0, help="v
 parser.add_argument("--vllm-sync-timeout", type=float, default=300.0, help="vLLM sync timeout")
 parser.add_argument("--vllm-weight-sync-backend", type=str, default="nccl", help="vLLM weight sync backend")
 parser.add_argument("--vllm-max-parallel-requests", type=int, default=8, help="vLLM max parallel requests")
+parser.add_argument(
+    "--attn-implementation",
+    type=str,
+    default="flash_attention_3",
+    help="Preferred trainer attention backend (falls back to sdpa if unavailable)",
+)
 
 args = parser.parse_args()
 user_config = vars(args).copy()
@@ -345,11 +352,12 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, token=HF_TOKE
 
 print0(f"Loading training model: {MODEL_ID}...")
 model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-model = AutoModelForCausalLM.from_pretrained(
+model, _resolved_attn_implementation = load_causal_lm_with_attention(
     MODEL_ID,
+    log_prefix="training model",
     token=HF_TOKEN,
     dtype=model_dtype,
-    attn_implementation="sdpa",
+    attn_implementation=args.attn_implementation,
 )
 model.config.use_cache = False
 model.to(device)
