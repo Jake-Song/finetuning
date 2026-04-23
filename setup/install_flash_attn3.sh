@@ -11,6 +11,12 @@ export MAX_JOBS="${MAX_JOBS:-4}"
 
 mkdir -p "$WORK_DIR"
 
+echo "Syncing trainer environment..."
+uv sync --project "$TRAINER_PROJECT"
+
+echo "Installing Python build tools into trainer environment..."
+uv pip install --python "$TRAINER_PROJECT/.venv/bin/python" "setuptools>=77,<81" wheel
+
 if ! command -v git >/dev/null 2>&1; then
     echo "git is required to install FlashAttention-3."
     exit 1

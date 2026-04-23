@@ -18,6 +18,8 @@ dependencies = [
     "pyzmq",
     "pybase64",
     "requests",
+    "setuptools>=77,<81",
+    "wheel",
 ]
 
 [build-system]
