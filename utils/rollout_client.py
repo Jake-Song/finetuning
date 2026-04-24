@@ -44,19 +44,18 @@ class OpenAICompatibleRolloutClient:
             temperature=temperature if temperature > 0 else 1.0,
             top_p=top_p,
             n=num_generations,
-            logprobs=0,
-            extra_body={"return_tokens_as_token_ids": True},
+            extra_body={"skip_special_tokens": False},
         )
 
         all_input_ids = []
         all_completion_masks = []
         all_texts = []
         for choice in response.choices:
-            completion_ids = [int(tok.split(":", 1)[1]) for tok in choice.logprobs.tokens]
+            text = choice.text
+            completion_ids = tokenizer.encode(text, add_special_tokens=False)
             seq_ids = prompt_ids + completion_ids
             mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
 
-            text = choice.text
             reward_text = text.split("</think>", 1)[1].lstrip() if "</think>" in text else ""
 
             all_input_ids.append(seq_ids)
