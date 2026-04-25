@@ -34,10 +34,11 @@ class OpenAICompatibleRolloutClient:
         num_generations: int,
     ) -> tuple[list[list[int]], list[list[int]], list[str]]:
         messages = [{"role": "user", "content": prompt}]
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
         response = self.client.completions.create(
             model=self.model_name,
-            prompt=messages,
+            prompt=prompt_text,
             max_tokens=max_new_tokens,
             temperature=temperature if temperature > 0 else 1.0,
             top_p=top_p,
@@ -45,7 +46,6 @@ class OpenAICompatibleRolloutClient:
             extra_body={"return_token_ids": True},
         )
 
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompt_ids = tokenizer.encode(prompt_text)
 
         all_input_ids = []
