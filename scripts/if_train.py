@@ -38,7 +38,7 @@ load_dotenv()
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
   
-MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
+MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 DATASET_NAME = "allenai/IF_multi_constraints_upto5"
 DATASET_CONFIG = "default"
 MAX_PROMPT_LENGTH = 4096
