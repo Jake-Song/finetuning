@@ -35,7 +35,6 @@ class OpenAICompatibleRolloutClient:
     ) -> tuple[list[list[int]], list[list[int]], list[str]]:
         messages = [{"role": "user", "content": prompt}]
         prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
         response = self.client.completions.create(
             model=self.model_name,
@@ -44,19 +43,27 @@ class OpenAICompatibleRolloutClient:
             temperature=temperature if temperature > 0 else 1.0,
             top_p=top_p,
             n=num_generations,
-            extra_body={"skip_special_tokens": False},
+            extra_body={"return_token_ids": True},
         )
 
         all_input_ids = []
         all_completion_masks = []
         all_texts = []
         for choice in response.choices:
-            text = choice.text
-            completion_ids = tokenizer.encode(text, add_special_tokens=False)
+            prompt_ids = list(choice.prompt_token_ids)
+            completion_ids = list(choice.token_ids)
             seq_ids = prompt_ids + completion_ids
             mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
 
-            reward_text = text.split("</think>", 1)[1].lstrip() if "</think>" in text else ""
+            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=False)
+            if "</think>" in completion_text:
+                after_think = completion_text.split("</think>", 1)[1]
+                reward_text = tokenizer.decode(
+                    tokenizer.encode(after_think, add_special_tokens=False),
+                    skip_special_tokens=True,
+                ).lstrip()
+            else:
+                reward_text = ""
 
             all_input_ids.append(seq_ids)
             all_completion_masks.append(mask)
