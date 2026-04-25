@@ -34,11 +34,10 @@ class OpenAICompatibleRolloutClient:
         num_generations: int,
     ) -> tuple[list[list[int]], list[list[int]], list[str]]:
         messages = [{"role": "user", "content": prompt}]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
+        
         response = self.client.completions.create(
             model=self.model_name,
-            prompt=prompt_text,
+            prompt=messages,
             max_tokens=max_new_tokens,
             temperature=temperature if temperature > 0 else 1.0,
             top_p=top_p,
@@ -46,24 +45,22 @@ class OpenAICompatibleRolloutClient:
             extra_body={"return_token_ids": True},
         )
 
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_ids = tokenizer.encode(prompt_text)
+
         all_input_ids = []
         all_completion_masks = []
         all_texts = []
         for choice in response.choices:
-            prompt_ids = list(choice.prompt_token_ids)
             completion_ids = list(choice.token_ids)
             seq_ids = prompt_ids + completion_ids
             mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
 
-            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=False)
+            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
             if "</think>" in completion_text:
-                after_think = completion_text.split("</think>", 1)[1]
-                reward_text = tokenizer.decode(
-                    tokenizer.encode(after_think, add_special_tokens=False),
-                    skip_special_tokens=True,
-                ).lstrip()
+                reward_text = completion_text.split("</think>", 1)[1].lstrip()
             else:
-                reward_text = ""
+                raise ValueError("There is no Completion. need to check in vllm server.")
 
             all_input_ids.append(seq_ids)
             all_completion_masks.append(mask)
@@ -83,7 +80,7 @@ class OpenAICompatibleRolloutClient:
     ) -> tuple[list[list[int]], list[list[int]], list[str]]:
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
         if not prompts:
-            return [], [], []
+            raise ValueError("generate_completions() requires at least one prompt")
 
         all_input_ids: list[list[int]] = []
         all_completion_masks: list[list[int]] = []
