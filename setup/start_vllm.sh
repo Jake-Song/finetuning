@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 MODEL="${1:-Qwen/Qwen3.6-35B-A3B-FP8}"
-MAX_MODEL_LEN="${2:-20500}"
+MAX_MODEL_LEN="${2:-20480}"
 HOST="${3:-0.0.0.0}"
 PORT="${4:-8000}"
 SYNC_BACKEND="${5:-nccl}"

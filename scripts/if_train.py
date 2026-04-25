@@ -41,7 +41,6 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 DATASET_NAME = "allenai/IF_multi_constraints_upto5"
 DATASET_CONFIG = "default"
-MAX_PROMPT_LENGTH = 4096
 
 parser = argparse.ArgumentParser(description="IFEval GRPO training (native PyTorch)")
 parser.add_argument("--dry-run", action="store_true", help="Validate config/dataset/tokenizer without training")
@@ -51,7 +50,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Generation
 parser.add_argument("--temperature", type=float, default=0.7, help="sampling temperature")
 parser.add_argument("--top-p", type=float, default=1.0, help="top-p sampling")
-parser.add_argument("--max-new-tokens", type=int, default=17425, help="max tokens to generate per sample")
+parser.add_argument("--max-new-tokens", type=int, default=17408, help="max tokens to generate per sample")
 
 # Training
 parser.add_argument("--num-generations", type=int, default=16, help="number of generations per example/question")
@@ -392,7 +391,7 @@ def load_ifeval_dataset(eval_size: int, max_train_examples: int | None) -> tuple
         if not prompt_text:
             continue
 
-        tokens = tokenizer.encode(prompt_text, truncation=True, max_length=MAX_PROMPT_LENGTH)
+        tokens = tokenizer.encode(prompt_text)
         prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
 
         gt = ast.literal_eval(example["ground_truth"])[0]
