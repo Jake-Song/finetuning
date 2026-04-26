@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-MODEL="${1:-Qwen/Qwen3.6-35B-A3B-FP8}"
+MODEL="${1:-Qwen/Qwen3.5-2B}"
 MAX_MODEL_LEN="${2:-20480}"
 HOST="${3:-0.0.0.0}"
 PORT="${4:-8000}"
@@ -17,6 +17,7 @@ VLLM_SERVER_DEV_MODE=1 uv --project "$ROOT_DIR/envs/vllm-server" run vllm serve 
     --host "$HOST" \
     --port "$PORT" \
     --enforce-eager \
+    --gdn-prefill-backend triton \
     --reasoning-parser deepseek_r1 \
     --weight-transfer-config "{\"backend\": \"$SYNC_BACKEND\"}" \
     --load-format dummy
